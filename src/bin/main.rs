@@ -1,8 +1,13 @@
 #![no_std]
 #![no_main]
 
+use core::net::Ipv4Addr;
+
 use defmt::info;
+use edge_dhcp::server::{Server as DhcpServer, ServerOptions as DhcpServerOptions};
+use edge_dhcp::{Options as DhcpOptions, Packet as DhcpPacket};
 use embassy_net::{Ipv4Address, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4, tcp::TcpSocket};
+use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_time::{Duration, Timer};
 use embedded_io_async::Write;
 use esp_hal::clock::CpuClock;
@@ -97,7 +102,7 @@ fn main() -> ! {
         dns_servers: Default::default(),
     });
 
-    static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+    static RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
     let (stack, runner) = embassy_net::new(
         interfaces.ap,
         net_config,
@@ -112,6 +117,7 @@ fn main() -> ! {
         spawner.must_spawn(led_task(led_driver));
         spawner.must_spawn(net_task(runner));
         spawner.must_spawn(web_server(stack));
+        spawner.must_spawn(dhcp_server(stack));
         spawner.must_spawn(wifi_keepalive(wifi_controller));
     })
 }
@@ -158,6 +164,68 @@ async fn led_task(mut driver: Ws2812SmartLeds<'static, BUFFER_SIZE, esp_hal::Blo
 #[embassy_executor::task]
 async fn net_task(mut runner: Runner<'static, esp_radio::wifi::WifiDevice<'static>>) {
     runner.run().await;
+}
+
+/// DHCP server assigning IPs to clients connecting to the AP.
+#[embassy_executor::task]
+async fn dhcp_server(stack: Stack<'static>) {
+    // Wait until the stack is configured
+    while !stack.is_config_up() {
+        Timer::after(Duration::from_millis(100)).await;
+    }
+
+    let mut rx_meta = [PacketMetadata::EMPTY; 2];
+    let mut rx_buffer = [0u8; 600];
+    let mut tx_meta = [PacketMetadata::EMPTY; 2];
+    let mut tx_buffer = [0u8; 600];
+
+    let mut socket = UdpSocket::new(stack, &mut rx_meta, &mut rx_buffer, &mut tx_meta, &mut tx_buffer);
+    socket.bind(67).expect("failed to bind DHCP server socket");
+
+    info!("DHCP server running on port 67");
+
+    let server_ip = Ipv4Addr::new(192, 168, 4, 1);
+    let mut gw_buf = [Ipv4Addr::UNSPECIFIED; 1];
+    let server_options = DhcpServerOptions::new(server_ip, Some(&mut gw_buf));
+
+    // Up to 8 concurrent leases
+    let mut server = DhcpServer::<_, 8>::new_with_et(server_ip);
+    server.range_start = Ipv4Addr::new(192, 168, 4, 50);
+    server.range_end = Ipv4Addr::new(192, 168, 4, 200);
+
+    let mut buf = [0u8; 600];
+
+    loop {
+        let (len, _meta) = match socket.recv_from(&mut buf).await {
+            Ok(result) => result,
+            Err(_) => continue,
+        };
+
+        let request = match DhcpPacket::decode(&buf[..len]) {
+            Ok(pkt) => pkt,
+            Err(e) => {
+                defmt::warn!("DHCP decode error: {}", defmt::Debug2Format(&e));
+                continue;
+            }
+        };
+
+        let mut opt_buf = DhcpOptions::buf();
+
+        if let Some(reply) = server.handle_request(&mut opt_buf, &server_options, &request) {
+            match reply.encode(&mut buf) {
+                Ok(encoded) => {
+                    // DHCP replies go to broadcast 255.255.255.255:68
+                    let dest = (Ipv4Address::new(255, 255, 255, 255), 68);
+                    if let Err(e) = socket.send_to(encoded, dest).await {
+                        defmt::warn!("DHCP send error: {}", defmt::Debug2Format(&e));
+                    }
+                }
+                Err(e) => {
+                    defmt::warn!("DHCP encode error: {}", defmt::Debug2Format(&e));
+                }
+            }
+        }
+    }
 }
 
 /// Simple HTTP server serving a test page.

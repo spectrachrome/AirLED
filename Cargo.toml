@@ -66,6 +66,7 @@ static_cell = { version = "2.1.0", features = ["nightly"] }
 esp-hal-smartled2 = { version = "*", features = ["esp32c3"] }
 smart-leds = "0.4.0"
 esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32c3"] }
+edge-dhcp = { version = "0.7.0", features = ["io", "defmt"] }
 
 [profile.dev]
 # Rust debug is too slow.

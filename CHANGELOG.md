@@ -15,6 +15,7 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 - WS2812 LED support via esp-hal-smartled2 and smart-leds
 - Wi-Fi AP hotspot (open, SSID: XIAO-LED-Controller) with static IP 192.168.4.1
 - HTTP test page on port 80
+- DHCP server via edge-dhcp, assigns IPs in 192.168.4.50–200 range
 - esp-bootloader-esp-idf app descriptor for probe-rs flashing
 - Project guidelines (CLAUDE.md)
 - Changelog
