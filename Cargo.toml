@@ -45,6 +45,7 @@ critical-section = "1.2.0"
 embassy-executor = { version = "0.9.1", features = [
   "defmt",
 ] }
+embassy-sync = "0.7.2"
 embassy-time = { version = "0.5.0", features = ["generic-queue-8"] }
 esp-rtos = { version = "0.2.0", features = [
   "embassy",

@@ -19,7 +19,9 @@ use esp_radio::wifi::{
     AccessPointConfig, ModeConfig, WifiApState, ap_state,
 };
 use panic_rtt_target as _;
-use smart_leds::{SmartLedsWrite, brightness, hsv::Hsv, hsv::hsv2rgb};
+use smart_leds::{SmartLedsWrite, brightness, RGB8};
+use xiao_drone_led_controller::pattern::{Pattern, RippleEffect};
+use xiao_drone_led_controller::state::STATE;
 use static_cell::StaticCell;
 
 extern crate alloc;
@@ -29,6 +31,9 @@ use alloc::string::ToString;
 
 /// Number of WS2812 LEDs in the strip.
 const NUM_LEDS: usize = 150;
+
+/// Maximum allowed strip current in milliamps (2A USB budget).
+const MAX_CURRENT_MA: u32 = 2000;
 
 /// RMT buffer size: 24 bits per LED (8 per channel * 3 channels) + 1 end marker.
 const BUFFER_SIZE: usize = NUM_LEDS * 24 + 1;
@@ -138,24 +143,52 @@ async fn wifi_keepalive(wifi_controller: esp_radio::wifi::WifiController<'static
     }
 }
 
-/// Drives the WS2812 LED strip with a rainbow cycle animation.
+/// Estimate strip current and clamp brightness to stay within the mA budget.
+///
+/// Model: each WS2812B draws ~1 mA idle + 8 mA per color channel at full PWM.
+/// Current scales linearly with the global brightness byte, so we solve for the
+/// exact brightness value that hits the budget — no iteration needed.
+fn clamp_brightness(buf: &[RGB8], brightness: u8, max_ma: u32) -> u8 {
+    // Sum (R + G + B) across all LEDs for the channel-current estimate.
+    let channel_sum: u32 = buf
+        .iter()
+        .map(|c| c.r as u32 + c.g as u32 + c.b as u32)
+        .sum();
+
+    // total_ma = (idle + channel_draw) * brightness / 255
+    //   idle         = num_leds * 1 mA
+    //   channel_draw = channel_sum * 8 / 255 mA  (at full brightness)
+    let num = buf.len() as u32;
+    let raw_ma_x255 = num * 255 + channel_sum * 8; // numerator, denominator is 255
+    let total_ma_x255 = raw_ma_x255 * brightness as u32; // denominator is 255*255
+
+    // Compare: total_ma_x255 / (255*255) vs max_ma
+    let limit = max_ma * 255 * 255;
+    if total_ma_x255 <= limit {
+        brightness
+    } else {
+        // clamped = brightness * max_ma / total_ma
+        //         = brightness * limit / total_ma_x255
+        (brightness as u32 * limit / total_ma_x255) as u8
+    }
+}
+
+/// Drives the WS2812 LED strip using the active pattern.
 #[embassy_executor::task]
 async fn led_task(mut driver: Ws2812SmartLeds<'static, BUFFER_SIZE, esp_hal::Blocking>) {
-    let mut hue: u8 = 0;
-    loop {
-        let colors = (0..NUM_LEDS).map(|i| {
-            hsv2rgb(Hsv {
-                hue: hue.wrapping_add((i * 256 / NUM_LEDS) as u8),
-                sat: 255,
-                val: 255,
-            })
-        });
+    let mut pattern = RippleEffect::new(0xDEAD_BEEF);
+    let mut buf = [RGB8 { r: 0, g: 0, b: 0 }; NUM_LEDS];
 
-        if let Err(e) = driver.write(brightness(colors, 32)) {
+    loop {
+        pattern.render(&mut buf);
+
+        let led_brightness = STATE.lock().await.brightness;
+        let clamped = clamp_brightness(&buf, led_brightness, MAX_CURRENT_MA);
+
+        if let Err(e) = driver.write(brightness(buf.iter().copied(), clamped)) {
             defmt::warn!("LED write error: {}", defmt::Debug2Format(&e));
         }
 
-        hue = hue.wrapping_add(1);
         Timer::after(Duration::from_millis(20)).await;
     }
 }
