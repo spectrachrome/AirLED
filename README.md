@@ -8,7 +8,7 @@ Firmware for a Seeed XIAO ESP32-C3 that drives a WS2812 LED strip on an FPV dron
 - **Modular pattern engine** — `Pattern` trait with swappable implementations
   - `RippleEffect` (default) — expanding ring particles with random hues on a deep navy background
   - `RainbowCycle` — classic hue-shifting rainbow
-- **Current-limited brightness** — estimates strip draw (8 mA/channel model) and clamps brightness to a 2A budget
+- **Current-limited brightness** — estimates strip draw (8 mA/channel model) and clamps brightness to a configurable mA budget (default 2000 mA)
 - **Wi-Fi access point** — open AP (`XIAO-LED-Controller`) with DHCP server and HTTP status page
 - **BLE support** — via bleps (not yet wired up)
 

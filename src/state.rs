@@ -24,6 +24,8 @@ pub enum FlightMode {
 pub struct LedState {
     /// Global brightness (0–255).
     pub brightness: u8,
+    /// Maximum allowed strip current in milliamps.
+    pub max_current_ma: u32,
     /// Current flight mode (drives LED pattern selection).
     pub flight_mode: FlightMode,
 }
@@ -32,6 +34,7 @@ impl Default for LedState {
     fn default() -> Self {
         Self {
             brightness: 32,
+            max_current_ma: 2000,
             flight_mode: FlightMode::ArmingForbidden,
         }
     }
@@ -42,5 +45,6 @@ impl Default for LedState {
 /// Lock with `STATE.lock().await` from any embassy task.
 pub static STATE: Mutex<CriticalSectionRawMutex, LedState> = Mutex::new(LedState {
     brightness: 32,
+    max_current_ma: 2000,
     flight_mode: FlightMode::ArmingForbidden,
 });

@@ -18,9 +18,18 @@
 - When resolving version conflicts, prioritize core crates (e.g. `esp-hal`) over peripheral dependencies. Adjust the less important crate to match, not the other way around.
 - Add Rust doc comments (`///`) on public items and inline comments for complex logic.
 
+## Shell Commands
+
+- Never use absolute paths in shell commands. Use plain commands from the working directory (e.g. `git push`, not `git -C /full/path push`).
+
 ## Process Management
 
 - Keep track of any application instances you start and ensure only a single instance is running at a time. Kill previous instances before starting new ones.
+
+## Versioning
+
+- Follow [Semantic Versioning](https://semver.org/) for `Cargo.toml` version bumps.
+- Suggest a version bump when a meaningful milestone is reached (new feature, breaking change, significant fix). Don't bump for every small commit — group related changes under one version when possible.
 
 ## Changelog
 

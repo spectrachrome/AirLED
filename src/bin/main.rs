@@ -32,9 +32,6 @@ use alloc::string::ToString;
 /// Number of WS2812 LEDs in the strip.
 const NUM_LEDS: usize = 150;
 
-/// Maximum allowed strip current in milliamps (2A USB budget).
-const MAX_CURRENT_MA: u32 = 2000;
-
 /// RMT buffer size: 24 bits per LED (8 per channel * 3 channels) + 1 end marker.
 const BUFFER_SIZE: usize = NUM_LEDS * 24 + 1;
 
@@ -182,8 +179,12 @@ async fn led_task(mut driver: Ws2812SmartLeds<'static, BUFFER_SIZE, esp_hal::Blo
     loop {
         pattern.render(&mut buf);
 
-        let led_brightness = STATE.lock().await.brightness;
-        let clamped = clamp_brightness(&buf, led_brightness, MAX_CURRENT_MA);
+        let state = STATE.lock().await;
+        let led_brightness = state.brightness;
+        let max_ma = state.max_current_ma;
+        drop(state);
+
+        let clamped = clamp_brightness(&buf, led_brightness, max_ma);
 
         if let Err(e) = driver.write(brightness(buf.iter().copied(), clamped)) {
             defmt::warn!("LED write error: {}", defmt::Debug2Format(&e));

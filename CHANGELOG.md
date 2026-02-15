@@ -12,7 +12,7 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 - `Pattern` trait in `src/pattern.rs` for modular LED patterns
 - `RainbowCycle` pattern implementing `Pattern` trait
 - `RippleEffect` pattern: particle-based expanding rings on ring topology with random hues and deep navy background
-- Current-limited brightness clamping (8 mA/channel model, 2A budget) to protect USB power supply
+- Current-limited brightness clamping (8 mA/channel model, configurable mA budget via shared state)
 - Shared `LedState` with `brightness` and `FlightMode` in `src/state.rs`
 - `embassy-sync` dependency for async mutex
 - `led_task` reads brightness from shared state instead of hardcoded value
