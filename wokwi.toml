@@ -1,0 +1,5 @@
+[wokwi]
+version = 1
+gdbServerPort = 3333
+elf = "target/riscv32imc-unknown-none-elf/debug/xiao_drone_led_controller"
+firmware = "target/riscv32imc-unknown-none-elf/debug/xiao_drone_led_controller"
