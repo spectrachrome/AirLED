@@ -9,6 +9,16 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Added
 
+- Per-pattern parameter sliders in web UI (pulse speed, min brightness, ripple speed/width/decay, hue speed)
+- `PatternParams` enum in `src/state.rs` with `default_for()` helper for mode-aware defaults
+- `set_params()` / `set_speed()` methods on all pattern structs for live parameter updates
+- JS visibility logic: per-pattern sliders show/hide based on selected mode
+
+### Changed
+
+- Mode changes in the web UI now reset pattern parameters to defaults
+- `led_task` applies live parameters from shared state each frame before rendering
+- `parse_query_params()` handles new per-pattern keys and mode-change param resets
 - Post-processing pipeline (`src/postfx.rs`) with composable `PostEffect` enum: `Brightness`, `Gamma`, `CurrentLimit`
 - Gamma 2.6 correction via 256-byte LUT (Adafruit gamma8 table)
 - SPI+DMA LED driver via `ws2812-spi` (replaces RMT, supports 200+ LEDs)

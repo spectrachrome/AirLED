@@ -16,18 +16,27 @@ pub trait Pattern {
 /// Cycles a full rainbow across the LED strip, shifting each frame.
 pub struct RainbowCycle {
     hue: u8,
+    /// Hue increment per frame (1 = slow, 10 = fast).
+    speed: u8,
 }
 
 impl RainbowCycle {
-    /// Create a new `RainbowCycle` starting at hue 0.
+    /// Create a new `RainbowCycle` starting at hue 0 with speed 1.
     pub fn new() -> Self {
-        Self { hue: 0 }
+        Self { hue: 0, speed: 1 }
     }
 }
 
 impl Default for RainbowCycle {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl RainbowCycle {
+    /// Update the hue increment per frame.
+    pub fn set_speed(&mut self, speed: u8) {
+        self.speed = speed;
     }
 }
 
@@ -41,7 +50,7 @@ impl Pattern for RainbowCycle {
                 val: 255,
             });
         }
-        self.hue = self.hue.wrapping_add(1);
+        self.hue = self.hue.wrapping_add(self.speed);
     }
 }
 
@@ -128,6 +137,13 @@ impl RippleEffect {
             width: 19.0,
             decay: 0.97,
         }
+    }
+
+    /// Update ripple parameters (speed, width, decay).
+    pub fn set_params(&mut self, speed: f32, width: f32, decay: f32) {
+        self.speed = speed;
+        self.width = width;
+        self.decay = decay.clamp(0.0, 1.0);
     }
 
     /// Spawn a new ripple at a random position with a random hue.
@@ -250,6 +266,12 @@ impl SinePulse {
         }
     }
 
+    /// Update pulse speed and minimum intensity floor.
+    pub fn set_params(&mut self, speed: u16, min_intensity: f32) {
+        self.speed = speed;
+        self.min_intensity = min_intensity.clamp(0.0, 1.0);
+    }
+
     /// Create a green sinusoidal pulse with default speed and 30% floor.
     pub fn green() -> Self {
         Self::new(RGB8 { r: 0, g: 204, b: 0 }, 600, 0.3)
@@ -269,9 +291,9 @@ impl Pattern for SinePulse {
         } else {
             65535 - self.phase
         };
-        // Normalize to 0.0–1.0 (linear — gamma correction handles perceptual curve)
+        // Cubic falloff: spends most time dim, snaps quickly to bright
         let t = half as f32 / 32767.0;
-        let intensity = self.min_intensity + (1.0 - self.min_intensity) * t;
+        let intensity = self.min_intensity + (1.0 - self.min_intensity) * t * t * t;
 
         let r = (self.color.r as f32 * intensity) as u8;
         let g = (self.color.g as f32 * intensity) as u8;
@@ -317,13 +339,19 @@ impl SplitPulse {
         }
     }
 
-    /// Green front half, red rear half, default speed and 30% floor.
+    /// Update pulse speed and minimum intensity floor.
+    pub fn set_params(&mut self, speed: u16, min_intensity: f32) {
+        self.speed = speed;
+        self.min_intensity = min_intensity.clamp(0.0, 1.0);
+    }
+
+    /// Green front half, red rear half, default speed and 40% floor.
     pub fn green_red() -> Self {
         Self::new(
             RGB8 { r: 0, g: 204, b: 0 },
             RGB8 { r: 204, g: 0, b: 0 },
             600,
-            0.3,
+            0.4,
         )
     }
 }
@@ -337,9 +365,9 @@ impl Pattern for SplitPulse {
         } else {
             65535 - self.phase
         };
-        // Linear intensity — gamma correction handles perceptual curve
+        // Cubic falloff: spends most time dim, snaps quickly to bright
         let t = half as f32 / 32767.0;
-        let intensity = self.min_intensity + (1.0 - self.min_intensity) * t;
+        let intensity = self.min_intensity + (1.0 - self.min_intensity) * t * t * t;
 
         let mid = leds.len() / 2;
 
