@@ -9,6 +9,8 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Added
 
+- Post-processing pipeline (`src/postfx.rs`) with composable `PostEffect` enum: `Brightness`, `Gamma`, `CurrentLimit`
+- Gamma 2.6 correction via 256-byte LUT (Adafruit gamma8 table)
 - SPI+DMA LED driver via `ws2812-spi` (replaces RMT, supports 200+ LEDs)
 - Interactive web UI with brightness (0–255), LED count (1–200), and FPS (1–150) sliders
 - `/set` HTTP endpoint for real-time parameter updates via query params
@@ -34,6 +36,10 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Changed
 
+- Pulse patterns (`SplitPulse`, `SinePulse`) linearized — gamma LUT now handles perceptual dimming
+- Pulse `min_intensity` raised from 0.1 to 0.3 so floor survives gamma correction
+- Default brightness raised from 128 to 200 to compensate for gamma darkening
+- `led_task` uses `apply_pipeline()` instead of ad-hoc `clamp_brightness()` + `smart_leds::brightness()`
 - LED driver switched from RMT (`esp-hal-smartled2`) to SPI+DMA (`ws2812-spi`) on GPIO10 (MOSI)
 - `MAX_LEDS` increased from 150 to 200 (no longer constrained by RMT buffer)
 - Default `num_leds` changed from 150 to 200

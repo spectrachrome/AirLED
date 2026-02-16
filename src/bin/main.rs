@@ -22,11 +22,12 @@ use esp_radio::wifi::{
     AccessPointConfig, ModeConfig, WifiApState, ap_state,
 };
 use panic_rtt_target as _;
-use smart_leds::{SmartLedsWrite, brightness, RGB8};
+use smart_leds::{SmartLedsWrite, RGB8};
 use ws2812_spi::prerendered::Ws2812;
 use xiao_drone_led_controller::pattern::{
     Pattern, RainbowCycle, RippleEffect, SinePulse, SplitPulse,
 };
+use xiao_drone_led_controller::postfx::{PostEffect, apply_pipeline};
 use xiao_drone_led_controller::state::{PatternMode, STATE};
 use static_cell::StaticCell;
 
@@ -145,36 +146,6 @@ async fn wifi_keepalive(wifi_controller: esp_radio::wifi::WifiController<'static
     }
 }
 
-/// Estimate strip current and clamp brightness to stay within the mA budget.
-///
-/// Model: each WS2812B draws ~1 mA idle + 8 mA per color channel at full PWM.
-/// Current scales linearly with the global brightness byte, so we solve for the
-/// exact brightness value that hits the budget — no iteration needed.
-fn clamp_brightness(buf: &[RGB8], brightness: u8, max_ma: u32) -> u8 {
-    // Sum (R + G + B) across all LEDs for the channel-current estimate.
-    let channel_sum: u32 = buf
-        .iter()
-        .map(|c| c.r as u32 + c.g as u32 + c.b as u32)
-        .sum();
-
-    // total_ma = (idle + channel_draw) * brightness / 255
-    //   idle         = num_leds * 1 mA
-    //   channel_draw = channel_sum * 8 / 255 mA  (at full brightness)
-    let num = buf.len() as u32;
-    let raw_ma_x255 = num * 255 + channel_sum * 8; // numerator, denominator is 255
-    let total_ma_x255 = raw_ma_x255 * brightness as u32; // denominator is 255*255
-
-    // Compare: total_ma_x255 / (255*255) vs max_ma
-    let limit = max_ma * 255 * 255;
-    if total_ma_x255 <= limit {
-        brightness
-    } else {
-        // clamped = brightness * max_ma / total_ma
-        //         = brightness * limit / total_ma_x255
-        (brightness as u32 * limit / total_ma_x255) as u8
-    }
-}
-
 /// Drives the WS2812 LED strip using the active pattern via SPI+DMA.
 #[embassy_executor::task]
 async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
@@ -204,9 +175,14 @@ async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
             PatternMode::Rainbow => rainbow.render(active),
         }
 
-        let clamped = clamp_brightness(active, led_brightness, max_ma);
+        let pipeline = [
+            PostEffect::Brightness(led_brightness),
+            PostEffect::Gamma,
+            PostEffect::CurrentLimit { max_ma },
+        ];
+        apply_pipeline(active, &pipeline);
 
-        match ws.write(brightness(active.iter().copied(), clamped)) {
+        match ws.write(active.iter().copied()) {
             Err(e) if !write_err_logged => {
                 defmt::warn!("LED write error: {}", defmt::Debug2Format(&e));
                 write_err_logged = true;
@@ -350,31 +326,38 @@ fn build_html_page(brightness: u8, num_leds: u16, fps: u8, mode: PatternMode) ->
 <html>
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>XIAO LED Controller</title>
+<title>DroneLED</title>
 <style>
-body{{font-family:sans-serif;max-width:480px;margin:20px auto;padding:0 16px}}
-h1{{font-size:1.4em}}
-label{{display:block;margin:16px 0 4px;font-weight:bold}}
-input[type=range]{{width:100%}}
-select{{width:100%;padding:6px;font-size:1em}}
-.val{{font-size:1.2em;color:#06c}}
+*{{box-sizing:border-box;margin:0}}
+body{{font:18px/1.5 -apple-system,system-ui,sans-serif;background:#0f172a;color:#e2e8f0;padding:16px}}
+.c{{max-width:400px;margin:0 auto}}
+h1{{font-size:1.3em;color:#f8fafc;margin-bottom:12px}}
+.g{{background:#1e293b;border-radius:10px;padding:14px;margin-bottom:10px}}
+label{{display:flex;justify-content:space-between;font-size:.85em;color:#94a3b8;margin-bottom:4px}}
+.v{{color:#38bdf8}}
+select,input[type=range]{{width:100%}}
+select{{background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:8px;font-size:.9em}}
+input[type=range]{{-webkit-appearance:none;height:6px;border-radius:3px;background:#334155;outline:none}}
+input[type=range]::-webkit-slider-thumb{{-webkit-appearance:none;width:20px;height:20px;border-radius:50%;background:#38bdf8;cursor:pointer}}
 </style>
 </head>
 <body>
-<h1>XIAO LED Controller</h1>
-<label>Mode:</label>
+<div class="c">
+<h1>DroneLED</h1>
+<div class="g"><label>Mode</label>
 <select id="md">
-<option value="split"{sel_split}>Split Pulse (Green/Red)</option>
+<option value="split"{sel_split}>Split Pulse</option>
 <option value="green"{sel_green}>Green Pulse</option>
 <option value="ripple"{sel_ripple}>Ripple</option>
 <option value="rainbow"{sel_rainbow}>Rainbow</option>
-</select>
-<label>Brightness: <span id="bv" class="val">{brightness}</span></label>
-<input type="range" id="br" min="0" max="255" value="{brightness}">
-<label>LED Count: <span id="lv" class="val">{num_leds}</span></label>
-<input type="range" id="lc" min="1" max="{max_leds}" value="{num_leds}">
-<label>FPS: <span id="fv" class="val">{fps}</span></label>
-<input type="range" id="fp" min="1" max="150" value="{fps}">
+</select></div>
+<div class="g"><label>Brightness <span class="v" id="bv">{brightness}</span></label>
+<input type="range" id="br" min="0" max="255" value="{brightness}"></div>
+<div class="g"><label>LEDs <span class="v" id="lv">{num_leds}</span></label>
+<input type="range" id="lc" min="1" max="{max_leds}" value="{num_leds}"></div>
+<div class="g"><label>FPS <span class="v" id="fv">{fps}</span></label>
+<input type="range" id="fp" min="1" max="150" value="{fps}"></div>
+</div>
 <script>
 var br=document.getElementById('br'),lc=document.getElementById('lc'),fp=document.getElementById('fp'),md=document.getElementById('md');
 var bv=document.getElementById('bv'),lv=document.getElementById('lv'),fv=document.getElementById('fv');

@@ -250,9 +250,9 @@ impl SinePulse {
         }
     }
 
-    /// Create a green sinusoidal pulse with default speed and 10% floor.
+    /// Create a green sinusoidal pulse with default speed and 30% floor.
     pub fn green() -> Self {
-        Self::new(RGB8 { r: 0, g: 204, b: 0 }, 600, 0.1)
+        Self::new(RGB8 { r: 0, g: 204, b: 0 }, 600, 0.3)
     }
 }
 
@@ -269,9 +269,9 @@ impl Pattern for SinePulse {
         } else {
             65535 - self.phase
         };
-        // Normalize to 0.0–1.0 and apply squared curve for smoothness
+        // Normalize to 0.0–1.0 (linear — gamma correction handles perceptual curve)
         let t = half as f32 / 32767.0;
-        let intensity = self.min_intensity + (1.0 - self.min_intensity) * t * t;
+        let intensity = self.min_intensity + (1.0 - self.min_intensity) * t;
 
         let r = (self.color.r as f32 * intensity) as u8;
         let g = (self.color.g as f32 * intensity) as u8;
@@ -317,13 +317,13 @@ impl SplitPulse {
         }
     }
 
-    /// Green front half, red rear half, default speed and 10% floor.
+    /// Green front half, red rear half, default speed and 30% floor.
     pub fn green_red() -> Self {
         Self::new(
             RGB8 { r: 0, g: 204, b: 0 },
             RGB8 { r: 204, g: 0, b: 0 },
             600,
-            0.1,
+            0.3,
         )
     }
 }
@@ -337,8 +337,9 @@ impl Pattern for SplitPulse {
         } else {
             65535 - self.phase
         };
+        // Linear intensity — gamma correction handles perceptual curve
         let t = half as f32 / 32767.0;
-        let intensity = self.min_intensity + (1.0 - self.min_intensity) * t * t;
+        let intensity = self.min_intensity + (1.0 - self.min_intensity) * t;
 
         let mid = leds.len() / 2;
 

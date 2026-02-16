@@ -21,6 +21,7 @@
 ## Shell Commands
 
 - Never use absolute paths in shell commands. Use plain commands from the working directory (e.g. `git push`, not `git -C /full/path push`).
+- Never execute Python (or any other interpreter) via shell. Use Rust `build.rs` scripts or `const` computation instead.
 
 ## Process Management
 

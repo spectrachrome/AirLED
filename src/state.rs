@@ -52,7 +52,7 @@ pub struct LedState {
 impl Default for LedState {
     fn default() -> Self {
         Self {
-            brightness: 128,
+            brightness: 200,
             num_leds: 180,
             fps: 100,
             max_current_ma: 2000,
@@ -66,7 +66,7 @@ impl Default for LedState {
 ///
 /// Lock with `STATE.lock().await` from any embassy task.
 pub static STATE: Mutex<CriticalSectionRawMutex, LedState> = Mutex::new(LedState {
-    brightness: 128,
+    brightness: 200,
     num_leds: 180,
     fps: 100,
     max_current_ma: 2000,
