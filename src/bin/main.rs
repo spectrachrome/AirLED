@@ -25,10 +25,10 @@ use panic_rtt_target as _;
 use smart_leds::{SmartLedsWrite, RGB8};
 use ws2812_spi::prerendered::Ws2812;
 use xiao_drone_led_controller::pattern::{
-    Pattern, RainbowCycle, RippleEffect, SinePulse, SplitPulse,
+    Animation, ColorScheme, Pulse, RippleEffect, StaticAnim,
 };
 use xiao_drone_led_controller::postfx::{PostEffect, apply_pipeline};
-use xiao_drone_led_controller::state::{PatternMode, PatternParams, STATE};
+use xiao_drone_led_controller::state::{AnimMode, AnimModeParams, ColorMode, STATE};
 use static_cell::StaticCell;
 
 extern crate alloc;
@@ -43,7 +43,7 @@ const MAX_LEDS: usize = 200;
 const SPI_BUF_LEN: usize = MAX_LEDS * 12;
 
 /// Wi-Fi AP SSID.
-const WIFI_SSID: &str = "DroneLED";
+const WIFI_SSID: &str = "AirLED";
 
 /// AP static IP address.
 const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
@@ -146,15 +146,32 @@ async fn wifi_keepalive(wifi_controller: esp_radio::wifi::WifiController<'static
     }
 }
 
-/// Drives the WS2812 LED strip using the active pattern via SPI+DMA.
+/// Build a [`ColorScheme`] from the current [`ColorMode`].
+fn build_color_scheme(mode: ColorMode) -> ColorScheme {
+    match mode {
+        ColorMode::SolidGreen => ColorScheme::Solid(RGB8 { r: 0, g: 204, b: 0 }),
+        ColorMode::SolidRed => ColorScheme::Solid(RGB8 { r: 204, g: 0, b: 0 }),
+        ColorMode::Split => ColorScheme::Split(
+            RGB8 { r: 0, g: 204, b: 0 },
+            RGB8 { r: 204, g: 0, b: 0 },
+        ),
+        ColorMode::Rainbow => ColorScheme::Rainbow { hue: 0, speed: 1 },
+    }
+}
+
+/// Drives the WS2812 LED strip using the active animation + color scheme via SPI+DMA.
 #[embassy_executor::task]
 async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
     let mut ws_buf = [0u8; SPI_BUF_LEN];
     let mut ws = Ws2812::new(spi_bus, &mut ws_buf);
-    let mut split_pulse = SplitPulse::green_red();
-    let mut green_pulse = SinePulse::green();
+
+    let mut pulse = Pulse::new();
     let mut ripple = RippleEffect::new(0xDEAD_BEEF);
-    let mut rainbow = RainbowCycle::new();
+    let mut static_anim = StaticAnim;
+
+    let mut color_scheme = build_color_scheme(ColorMode::Split);
+    let mut prev_color_mode = ColorMode::Split;
+
     let mut buf = [RGB8 { r: 0, g: 0, b: 0 }; MAX_LEDS];
     let mut write_err_logged = false;
 
@@ -164,36 +181,39 @@ async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
         let led_brightness = state.brightness;
         let max_ma = state.max_current_ma;
         let fps = state.fps.max(1);
-        let mode = state.pattern;
-        let params = state.params;
+        let color_mode = state.color_mode;
+        let color_params = state.color_params;
+        let anim_mode = state.anim_mode;
+        let anim_params = state.anim_params;
         drop(state);
 
-        // Apply live parameters to the active pattern before rendering.
-        match params {
-            PatternParams::SplitPulse { speed, min_intensity_pct } => {
-                split_pulse.set_params(speed, min_intensity_pct as f32 / 100.0);
+        // Rebuild color scheme when the mode changes, preserving rainbow hue otherwise.
+        if color_mode != prev_color_mode {
+            color_scheme = build_color_scheme(color_mode);
+            prev_color_mode = color_mode;
+        }
+        color_scheme.set_hue_speed(color_params.hue_speed);
+
+        // Apply live animation parameters.
+        match anim_params {
+            AnimModeParams::Pulse { speed, min_intensity_pct } => {
+                pulse.set_params(speed, min_intensity_pct as f32 / 100.0);
             }
-            PatternParams::GreenPulse { speed, min_intensity_pct } => {
-                green_pulse.set_params(speed, min_intensity_pct as f32 / 100.0);
-            }
-            PatternParams::Ripple { speed_x10, width_x10, decay_pct } => {
+            AnimModeParams::Ripple { speed_x10, width_x10, decay_pct } => {
                 ripple.set_params(
                     speed_x10 as f32 / 10.0,
                     width_x10 as f32 / 10.0,
                     decay_pct as f32 / 100.0,
                 );
             }
-            PatternParams::Rainbow { hue_speed } => {
-                rainbow.set_speed(hue_speed);
-            }
+            AnimModeParams::Static => {}
         }
 
         let active = &mut buf[..num_leds];
-        match mode {
-            PatternMode::SplitPulse => split_pulse.render(active),
-            PatternMode::GreenPulse => green_pulse.render(active),
-            PatternMode::Ripple => ripple.render(active),
-            PatternMode::Rainbow => rainbow.render(active),
+        match anim_mode {
+            AnimMode::Static => static_anim.render(active, &mut color_scheme),
+            AnimMode::Pulse => pulse.render(active, &mut color_scheme),
+            AnimMode::Ripple => ripple.render(active, &mut color_scheme),
         }
 
         let pipeline = [
@@ -289,27 +309,42 @@ async fn dhcp_server(stack: Stack<'static>) {
 
 /// Parse query parameters from a request path, updating state values.
 ///
-/// Expects the query portion after `?`, e.g. `brightness=128&num_leds=100`.
+/// Expects the query portion after `?`, e.g. `brightness=128&color=split&anim=pulse`.
 /// Unknown keys are silently ignored.
 fn parse_query_params(query: &str, state: &mut xiao_drone_led_controller::state::LedState) {
-    // Check for mode change first — if present, reset params to defaults
-    // before applying any per-pattern overrides in the same request.
+    // Check for color/anim mode changes first — if present, reset params to defaults
+    // before applying per-mode overrides in the same request.
     for pair in query.split('&') {
-        if let Some(("mode", value)) = pair.split_once('=') {
-            let new_mode = match value {
-                "split" => Some(PatternMode::SplitPulse),
-                "green" => Some(PatternMode::GreenPulse),
-                "ripple" => Some(PatternMode::Ripple),
-                "rainbow" => Some(PatternMode::Rainbow),
-                _ => None,
-            };
-            if let Some(m) = new_mode {
-                if m != state.pattern {
-                    state.pattern = m;
-                    state.params = PatternParams::default_for(m);
+        if let Some((key, value)) = pair.split_once('=') {
+            match key {
+                "color" => {
+                    let new_mode = match value {
+                        "solid_green" => Some(ColorMode::SolidGreen),
+                        "solid_red" => Some(ColorMode::SolidRed),
+                        "split" => Some(ColorMode::Split),
+                        "rainbow" => Some(ColorMode::Rainbow),
+                        _ => None,
+                    };
+                    if let Some(m) = new_mode {
+                        state.color_mode = m;
+                    }
                 }
+                "anim" => {
+                    let new_mode = match value {
+                        "static" => Some(AnimMode::Static),
+                        "pulse" => Some(AnimMode::Pulse),
+                        "ripple" => Some(AnimMode::Ripple),
+                        _ => None,
+                    };
+                    if let Some(m) = new_mode {
+                        if m != state.anim_mode {
+                            state.anim_mode = m;
+                            state.anim_params = AnimModeParams::default_for(m);
+                        }
+                    }
+                }
+                _ => {}
             }
-            break;
         }
     }
 
@@ -336,54 +371,44 @@ fn parse_query_params(query: &str, state: &mut xiao_drone_led_controller::state:
                         state.max_current_ma = v.clamp(100, 2500);
                     }
                 }
-                "mode" => { /* already handled above */ }
+                "color" | "anim" => { /* already handled above */ }
+                "hue_speed" => {
+                    if let Ok(v) = value.parse::<u8>() {
+                        state.color_params.hue_speed = v.clamp(1, 10);
+                    }
+                }
                 "pulse_speed" => {
                     if let Ok(v) = value.parse::<u16>() {
-                        match &mut state.params {
-                            PatternParams::SplitPulse { speed, .. }
-                            | PatternParams::GreenPulse { speed, .. } => {
-                                *speed = v.clamp(100, 2000);
-                            }
-                            _ => {}
+                        if let AnimModeParams::Pulse { speed, .. } = &mut state.anim_params {
+                            *speed = v.clamp(100, 2000);
                         }
                     }
                 }
                 "min_brightness" => {
                     if let Ok(v) = value.parse::<u8>() {
-                        match &mut state.params {
-                            PatternParams::SplitPulse { min_intensity_pct, .. }
-                            | PatternParams::GreenPulse { min_intensity_pct, .. } => {
-                                *min_intensity_pct = v.min(80);
-                            }
-                            _ => {}
+                        if let AnimModeParams::Pulse { min_intensity_pct, .. } = &mut state.anim_params {
+                            *min_intensity_pct = v.min(80);
                         }
                     }
                 }
                 "ripple_speed" => {
                     if let Ok(v) = value.parse::<u8>() {
-                        if let PatternParams::Ripple { speed_x10, .. } = &mut state.params {
+                        if let AnimModeParams::Ripple { speed_x10, .. } = &mut state.anim_params {
                             *speed_x10 = v.clamp(5, 50);
                         }
                     }
                 }
                 "ripple_width" => {
                     if let Ok(v) = value.parse::<u8>() {
-                        if let PatternParams::Ripple { width_x10, .. } = &mut state.params {
+                        if let AnimModeParams::Ripple { width_x10, .. } = &mut state.anim_params {
                             *width_x10 = v.clamp(10, 255);
                         }
                     }
                 }
                 "ripple_decay" => {
                     if let Ok(v) = value.parse::<u8>() {
-                        if let PatternParams::Ripple { decay_pct, .. } = &mut state.params {
+                        if let AnimModeParams::Ripple { decay_pct, .. } = &mut state.anim_params {
                             *decay_pct = v.clamp(90, 99);
-                        }
-                    }
-                }
-                "hue_speed" => {
-                    if let Ok(v) = value.parse::<u8>() {
-                        if let PatternParams::Rainbow { hue_speed } = &mut state.params {
-                            *hue_speed = v.clamp(1, 10);
                         }
                     }
                 }
@@ -393,63 +418,63 @@ fn parse_query_params(query: &str, state: &mut xiao_drone_led_controller::state:
     }
 }
 
-/// Map a `PatternMode` to its query-string key.
-fn mode_key(mode: PatternMode) -> &'static str {
+/// Map a [`ColorMode`] to its query-string key.
+fn color_key(mode: ColorMode) -> &'static str {
     match mode {
-        PatternMode::SplitPulse => "split",
-        PatternMode::GreenPulse => "green",
-        PatternMode::Ripple => "ripple",
-        PatternMode::Rainbow => "rainbow",
+        ColorMode::SolidGreen => "solid_green",
+        ColorMode::SolidRed => "solid_red",
+        ColorMode::Split => "split",
+        ColorMode::Rainbow => "rainbow",
+    }
+}
+
+/// Map an [`AnimMode`] to its query-string key.
+fn anim_key(mode: AnimMode) -> &'static str {
+    match mode {
+        AnimMode::Static => "static",
+        AnimMode::Pulse => "pulse",
+        AnimMode::Ripple => "ripple",
     }
 }
 
 /// Build the HTML control page with current state values injected.
-fn build_html_page(
-    brightness: u8,
-    num_leds: u16,
-    fps: u8,
-    max_current_ma: u32,
-    mode: PatternMode,
-    params: PatternParams,
-) -> alloc::string::String {
+fn build_html_page(state: &xiao_drone_led_controller::state::LedState) -> alloc::string::String {
+    let brightness = state.brightness;
+    let num_leds = state.num_leds;
+    let fps = state.fps;
+    let max_current_ma = state.max_current_ma;
+    let color_mode = state.color_mode;
+    let anim_mode = state.anim_mode;
+    let anim_params = state.anim_params;
+    let hue_speed = state.color_params.hue_speed;
+
     // Extract param values (use defaults for non-matching variants).
-    let (pulse_speed, min_brightness) = match params {
-        PatternParams::SplitPulse { speed, min_intensity_pct }
-        | PatternParams::GreenPulse { speed, min_intensity_pct } => (speed, min_intensity_pct),
-        _ => {
-            let d = PatternParams::default_for(PatternMode::SplitPulse);
-            match d {
-                PatternParams::SplitPulse { speed, min_intensity_pct } => (speed, min_intensity_pct),
-                _ => unreachable!(),
-            }
-        }
+    let (pulse_speed, min_brightness) = match anim_params {
+        AnimModeParams::Pulse { speed, min_intensity_pct } => (speed, min_intensity_pct),
+        _ => (600, 40),
     };
-    let (ripple_speed, ripple_width, ripple_decay) = match params {
-        PatternParams::Ripple { speed_x10, width_x10, decay_pct } => (speed_x10, width_x10, decay_pct),
-        _ => {
-            let d = PatternParams::default_for(PatternMode::Ripple);
-            match d {
-                PatternParams::Ripple { speed_x10, width_x10, decay_pct } => (speed_x10, width_x10, decay_pct),
-                _ => unreachable!(),
-            }
-        }
-    };
-    let hue_speed = match params {
-        PatternParams::Rainbow { hue_speed } => hue_speed,
-        _ => 1,
+    let (ripple_speed, ripple_width, ripple_decay) = match anim_params {
+        AnimModeParams::Ripple { speed_x10, width_x10, decay_pct } => (speed_x10, width_x10, decay_pct),
+        _ => (15, 190, 97),
     };
 
-    let sel = |key| if mode_key(mode) == key { " selected" } else { "" };
-    let sel_split = sel("split");
-    let sel_green = sel("green");
-    let sel_ripple = sel("ripple");
-    let sel_rainbow = sel("rainbow");
+    let csel = |key| if color_key(color_mode) == key { " selected" } else { "" };
+    let asel = |key| if anim_key(anim_mode) == key { " selected" } else { "" };
+
+    let sel_solid_green = csel("solid_green");
+    let sel_solid_red = csel("solid_red");
+    let sel_split = csel("split");
+    let sel_rainbow = csel("rainbow");
+    let sel_static = asel("static");
+    let sel_pulse = asel("pulse");
+    let sel_ripple = asel("ripple");
+
     alloc::format!(
         r#"<!DOCTYPE html>
 <html>
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DroneLED</title>
+<title>AirLED</title>
 <style>
 *{{box-sizing:border-box;margin:0}}
 body{{font:18px/1.5 -apple-system,system-ui,sans-serif;background:#0f172a;color:#e2e8f0;padding:16px}}
@@ -470,13 +495,19 @@ input[type=range]::-webkit-slider-thumb{{-webkit-appearance:none;width:20px;heig
 </head>
 <body>
 <div class="c">
-<h1>DroneLED</h1>
-<div class="g"><label>Mode</label>
-<select id="md">
-<option value="split"{sel_split}>Split Pulse</option>
-<option value="green"{sel_green}>Green Pulse</option>
-<option value="ripple"{sel_ripple}>Ripple</option>
+<h1>AirLED</h1>
+<div class="g"><label>Color</label>
+<select id="cm">
+<option value="solid_green"{sel_solid_green}>Solid Green</option>
+<option value="solid_red"{sel_solid_red}>Solid Red</option>
+<option value="split"{sel_split}>Split (Green/Red)</option>
 <option value="rainbow"{sel_rainbow}>Rainbow</option>
+</select></div>
+<div class="g"><label>Animation</label>
+<select id="am">
+<option value="static"{sel_static}>Static</option>
+<option value="pulse"{sel_pulse}>Pulse</option>
+<option value="ripple"{sel_ripple}>Ripple</option>
 </select></div>
 <div class="g"><label>Brightness <span class="v" id="bv">{brightness}</span></label>
 <input type="range" id="br" min="0" max="255" value="{brightness}"></div>
@@ -486,22 +517,23 @@ input[type=range]::-webkit-slider-thumb{{-webkit-appearance:none;width:20px;heig
 <input type="range" id="fp" min="1" max="150" value="{fps}"></div>
 <div class="g"><label>Current Limit <span class="v" id="cv">{max_current_ma}</span> mA</label>
 <input type="range" id="cl" min="100" max="2500" step="50" value="{max_current_ma}"></div>
-<div class="g pm" data-mode="split,green"><label>Pulse Speed <span class="v" id="psv">{pulse_speed}</span></label>
-<input type="range" id="ps" min="100" max="2000" value="{pulse_speed}"></div>
-<div class="g pm" data-mode="split,green"><label>Min Brightness <span class="v" id="mbv">{min_brightness}</span>%</label>
-<input type="range" id="mb" min="0" max="80" value="{min_brightness}"></div>
-<div class="g pm" data-mode="ripple"><label>Ripple Speed <span class="v" id="rsv">{ripple_speed}</span></label>
-<input type="range" id="rs" min="5" max="50" value="{ripple_speed}"></div>
-<div class="g pm" data-mode="ripple"><label>Ripple Width <span class="v" id="rwv">{ripple_width}</span></label>
-<input type="range" id="rw" min="10" max="255" value="{ripple_width}"></div>
-<div class="g pm" data-mode="ripple"><label>Ripple Decay <span class="v" id="rdv">{ripple_decay}</span>%</label>
-<input type="range" id="rd" min="90" max="99" value="{ripple_decay}"></div>
-<div class="g pm" data-mode="rainbow"><label>Hue Speed <span class="v" id="hsv">{hue_speed}</span></label>
+<div class="g pm" data-color="rainbow"><label>Hue Speed <span class="v" id="hsv">{hue_speed}</span></label>
 <input type="range" id="hs" min="1" max="10" value="{hue_speed}"></div>
+<div class="g pm" data-anim="pulse"><label>Pulse Speed <span class="v" id="psv">{pulse_speed}</span></label>
+<input type="range" id="ps" min="100" max="2000" value="{pulse_speed}"></div>
+<div class="g pm" data-anim="pulse"><label>Min Brightness <span class="v" id="mbv">{min_brightness}</span>%</label>
+<input type="range" id="mb" min="0" max="80" value="{min_brightness}"></div>
+<div class="g pm" data-anim="ripple"><label>Ripple Speed <span class="v" id="rsv">{ripple_speed}</span></label>
+<input type="range" id="rs" min="5" max="50" value="{ripple_speed}"></div>
+<div class="g pm" data-anim="ripple"><label>Ripple Width <span class="v" id="rwv">{ripple_width}</span></label>
+<input type="range" id="rw" min="10" max="255" value="{ripple_width}"></div>
+<div class="g pm" data-anim="ripple"><label>Ripple Decay <span class="v" id="rdv">{ripple_decay}</span>%</label>
+<input type="range" id="rd" min="90" max="99" value="{ripple_decay}"></div>
 </div>
 <div id="sb"></div>
 <script>
-var br=document.getElementById('br'),lc=document.getElementById('lc'),fp=document.getElementById('fp'),cl=document.getElementById('cl'),md=document.getElementById('md');
+var br=document.getElementById('br'),lc=document.getElementById('lc'),fp=document.getElementById('fp'),cl=document.getElementById('cl');
+var cm=document.getElementById('cm'),am=document.getElementById('am');
 var bv=document.getElementById('bv'),lv=document.getElementById('lv'),fv=document.getElementById('fv'),cv=document.getElementById('cv');
 var ps=document.getElementById('ps'),mb=document.getElementById('mb');
 var rs=document.getElementById('rs'),rw=document.getElementById('rw'),rd=document.getElementById('rd');
@@ -510,17 +542,18 @@ var psv=document.getElementById('psv'),mbv=document.getElementById('mbv');
 var rsv=document.getElementById('rsv'),rwv=document.getElementById('rwv'),rdv=document.getElementById('rdv');
 var hsv=document.getElementById('hsv');
 var t;
-function updateVis(){{var m=md.value;document.querySelectorAll('.pm').forEach(function(el){{el.style.display=el.dataset.mode.split(',').indexOf(m)>=0?'':'none'}})}}
+function updateVis(){{var c=cm.value,a=am.value;document.querySelectorAll('.pm').forEach(function(el){{var sc=el.dataset.color,sa=el.dataset.anim;var show=true;if(sc)show=show&&sc===c;if(sa)show=show&&sa===a;el.style.display=show?'':'none'}})}}
 var sb=document.getElementById('sb'),con=null,ht;
 function toast(ok){{if(ok===con)return;con=ok;sb.textContent=ok?'Connected':'Disconnected';sb.className=ok?'show ok':'show err';clearTimeout(ht);if(ok)ht=setTimeout(function(){{sb.className=''}},2000)}}
-function send(){{var q='brightness='+br.value+'&num_leds='+lc.value+'&fps='+fp.value+'&max_current_ma='+cl.value+'&mode='+md.value;var m=md.value;if(m==='split'||m==='green')q+='&pulse_speed='+ps.value+'&min_brightness='+mb.value;if(m==='ripple')q+='&ripple_speed='+rs.value+'&ripple_width='+rw.value+'&ripple_decay='+rd.value;if(m==='rainbow')q+='&hue_speed='+hs.value;fetch('/set?'+q).then(function(){{toast(true)}}).catch(function(){{toast(false)}})}}
+function send(){{var q='brightness='+br.value+'&num_leds='+lc.value+'&fps='+fp.value+'&max_current_ma='+cl.value+'&color='+cm.value+'&anim='+am.value;var c=cm.value,a=am.value;if(c==='rainbow')q+='&hue_speed='+hs.value;if(a==='pulse')q+='&pulse_speed='+ps.value+'&min_brightness='+mb.value;if(a==='ripple')q+='&ripple_speed='+rs.value+'&ripple_width='+rw.value+'&ripple_decay='+rd.value;fetch('/set?'+q).then(function(){{toast(true)}}).catch(function(){{toast(false)}})}}
 setInterval(function(){{fetch('/set').then(function(){{toast(true)}}).catch(function(){{toast(false)}})}},3000);
 function sl(el,vl){{el.oninput=function(){{vl.textContent=el.value;clearTimeout(t);t=setTimeout(send,80)}}}}
 sl(br,bv);sl(lc,lv);sl(fp,fv);sl(cl,cv);sl(ps,psv);sl(mb,mbv);sl(rs,rsv);sl(rw,rwv);sl(rd,rdv);sl(hs,hsv);
 var _bro=br.oninput;br.oninput=function(){{_bro.call(this);ubr()}};
 function ubr(){{var v=br.value/255;br.style.background='rgb('+Math.round(51+5*v)+','+Math.round(65+124*v)+','+Math.round(85+163*v)+')'}}
 ubr();
-md.onchange=function(){{updateVis();send()}};
+cm.onchange=function(){{updateVis();send()}};
+am.onchange=function(){{updateVis();send()}};
 updateVis();
 </script>
 </body>
@@ -530,10 +563,13 @@ updateVis();
         max_leds = MAX_NUM_LEDS,
         fps = fps,
         max_current_ma = max_current_ma,
+        sel_solid_green = sel_solid_green,
+        sel_solid_red = sel_solid_red,
         sel_split = sel_split,
-        sel_green = sel_green,
-        sel_ripple = sel_ripple,
         sel_rainbow = sel_rainbow,
+        sel_static = sel_static,
+        sel_pulse = sel_pulse,
+        sel_ripple = sel_ripple,
         pulse_speed = pulse_speed,
         min_brightness = min_brightness,
         ripple_speed = ripple_speed,
@@ -596,14 +632,7 @@ async fn web_server(stack: Stack<'static>) {
         } else {
             // Serve the control page with current values
             let state = STATE.lock().await;
-            let page = build_html_page(
-                state.brightness,
-                state.num_leds,
-                state.fps,
-                state.max_current_ma,
-                state.pattern,
-                state.params,
-            );
+            let page = build_html_page(&state);
             drop(state);
 
             let header = alloc::format!(

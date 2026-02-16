@@ -6,73 +6,80 @@
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 
-/// Active LED pattern.
+/// Active color scheme.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, defmt::Format)]
-pub enum PatternMode {
-    /// Green/red split sinusoidal pulse.
-    SplitPulse,
-    /// Green sinusoidal pulse (arming allowed).
-    GreenPulse,
-    /// Expanding ring ripples on black background.
-    Ripple,
-    /// Full rainbow cycle.
+pub enum ColorMode {
+    /// Solid green.
+    SolidGreen,
+    /// Solid red.
+    SolidRed,
+    /// Green/red split (port / starboard).
+    Split,
+    /// Rainbow HSV gradient.
     Rainbow,
 }
 
-/// Per-pattern tunable parameters.
-///
-/// Uses integer representations to stay `Copy` and avoid float parsing on the
-/// embedded side.
+/// Active animation type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, defmt::Format)]
+pub enum AnimMode {
+    /// Static fill (no motion).
+    Static,
+    /// Sinusoidal breathing pulse.
+    Pulse,
+    /// Expanding ring ripples.
+    Ripple,
+}
+
+/// Color-scheme-specific parameters.
 #[derive(Clone, Copy, Debug, defmt::Format)]
-pub enum PatternParams {
-    /// Parameters for [`PatternMode::SplitPulse`].
-    SplitPulse {
+pub struct ColorModeParams {
+    /// Hue increment per frame (only used by `Rainbow`, ignored otherwise).
+    pub hue_speed: u8,
+}
+
+impl Default for ColorModeParams {
+    fn default() -> Self {
+        Self { hue_speed: 1 }
+    }
+}
+
+/// Animation-specific parameters.
+#[derive(Clone, Copy, Debug, defmt::Format)]
+pub enum AnimModeParams {
+    /// No extra parameters.
+    Static,
+    /// Pulse parameters.
+    Pulse {
         /// Phase increment per frame (higher = faster pulse). Typical range 100–2000.
         speed: u16,
-        /// Minimum brightness floor as a percentage (0–100, maps to 0.0–1.0).
+        /// Minimum brightness floor as a percentage (0–100).
         min_intensity_pct: u8,
     },
-    /// Parameters for [`PatternMode::GreenPulse`].
-    GreenPulse {
-        /// Phase increment per frame (higher = faster pulse). Typical range 100–2000.
-        speed: u16,
-        /// Minimum brightness floor as a percentage (0–100, maps to 0.0–1.0).
-        min_intensity_pct: u8,
-    },
-    /// Parameters for [`PatternMode::Ripple`].
+    /// Ripple parameters.
     Ripple {
-        /// Ripple expansion speed in fixed-point ×10 (e.g. 15 means 1.5 LEDs/frame).
+        /// Ripple expansion speed in fixed-point x10 (e.g. 15 = 1.5 LEDs/frame).
         speed_x10: u8,
-        /// Ring wavefront half-width in fixed-point ×10 (e.g. 190 means 19.0 LEDs).
+        /// Ring wavefront half-width in fixed-point x10 (e.g. 190 = 19.0 LEDs).
         width_x10: u8,
-        /// Per-frame amplitude decay as a percentage (90–99, maps to 0.90–0.99).
+        /// Per-frame amplitude decay as a percentage (90–99).
         decay_pct: u8,
-    },
-    /// Parameters for [`PatternMode::Rainbow`].
-    Rainbow {
-        /// Hue increment per frame (1–10). Higher = faster color cycling.
-        hue_speed: u8,
     },
 }
 
-impl PatternParams {
-    /// Return sensible defaults for the given pattern mode.
-    pub fn default_for(mode: PatternMode) -> Self {
+impl AnimModeParams {
+    /// Return sensible defaults for the given animation mode.
+    pub fn default_for(mode: AnimMode) -> Self {
         match mode {
-            PatternMode::SplitPulse => PatternParams::SplitPulse {
+            AnimMode::Static => AnimModeParams::Static,
+            AnimMode::Pulse => AnimModeParams::Pulse {
                 speed: 600,
                 min_intensity_pct: 40,
             },
-            PatternMode::GreenPulse => PatternParams::GreenPulse {
-                speed: 600,
-                min_intensity_pct: 30,
-            },
-            PatternMode::Ripple => PatternParams::Ripple {
+            AnimMode::Ripple => AnimModeParams::Ripple {
                 speed_x10: 15,
                 width_x10: 190,
                 decay_pct: 97,
             },
-            PatternMode::Rainbow => PatternParams::Rainbow { hue_speed: 1 },
         }
     }
 }
@@ -103,10 +110,14 @@ pub struct LedState {
     pub max_current_ma: u32,
     /// Current flight mode (drives LED pattern selection).
     pub flight_mode: FlightMode,
-    /// Active LED pattern.
-    pub pattern: PatternMode,
-    /// Per-pattern tunable parameters.
-    pub params: PatternParams,
+    /// Active color scheme.
+    pub color_mode: ColorMode,
+    /// Color-scheme-specific parameters.
+    pub color_params: ColorModeParams,
+    /// Active animation type.
+    pub anim_mode: AnimMode,
+    /// Animation-specific parameters.
+    pub anim_params: AnimModeParams,
 }
 
 impl Default for LedState {
@@ -117,8 +128,10 @@ impl Default for LedState {
             fps: 100,
             max_current_ma: 2000,
             flight_mode: FlightMode::ArmingForbidden,
-            pattern: PatternMode::SplitPulse,
-            params: PatternParams::default_for(PatternMode::SplitPulse),
+            color_mode: ColorMode::Split,
+            color_params: ColorModeParams::default(),
+            anim_mode: AnimMode::Pulse,
+            anim_params: AnimModeParams::default_for(AnimMode::Pulse),
         }
     }
 }
@@ -132,8 +145,10 @@ pub static STATE: Mutex<CriticalSectionRawMutex, LedState> = Mutex::new(LedState
     fps: 100,
     max_current_ma: 2000,
     flight_mode: FlightMode::ArmingForbidden,
-    pattern: PatternMode::SplitPulse,
-    params: PatternParams::SplitPulse {
+    color_mode: ColorMode::Split,
+    color_params: ColorModeParams { hue_speed: 1 },
+    anim_mode: AnimMode::Pulse,
+    anim_params: AnimModeParams::Pulse {
         speed: 600,
         min_intensity_pct: 40,
     },

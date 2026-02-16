@@ -1,56 +1,157 @@
-//! LED pattern trait and built-in pattern implementations.
+//! Color schemes, animation trait, and built-in animation implementations.
+//!
+//! The LED system is split into two independent axes:
+//! - [`ColorScheme`] determines the base color at each LED position.
+//! - [`Animation`] determines how those colors are modulated over time.
 
 use smart_leds::RGB8;
 use smart_leds::hsv::{Hsv, hsv2rgb};
 
-/// A pattern that renders frames into an LED buffer.
-pub trait Pattern {
-    /// Render the next frame into the provided LED buffer.
-    fn render(&mut self, leds: &mut [RGB8]);
-}
-
 // ---------------------------------------------------------------------------
-// Rainbow cycle
+// Color schemes
 // ---------------------------------------------------------------------------
 
-/// Cycles a full rainbow across the LED strip, shifting each frame.
-pub struct RainbowCycle {
-    hue: u8,
-    /// Hue increment per frame (1 = slow, 10 = fast).
-    speed: u8,
+/// Base color scheme that maps LED positions to colors.
+pub enum ColorScheme {
+    /// Single solid color for all LEDs.
+    Solid(RGB8),
+    /// First half one color, second half another (port / starboard).
+    Split(RGB8, RGB8),
+    /// HSV rainbow gradient that shifts over time.
+    Rainbow {
+        /// Current base hue (advances each tick).
+        hue: u8,
+        /// Hue increment per tick.
+        speed: u8,
+    },
 }
 
-impl RainbowCycle {
-    /// Create a new `RainbowCycle` starting at hue 0 with speed 1.
-    pub fn new() -> Self {
-        Self { hue: 0, speed: 1 }
+impl ColorScheme {
+    /// Return the base color at the given LED index.
+    pub fn color_at(&self, index: usize, num_leds: usize) -> RGB8 {
+        match self {
+            ColorScheme::Solid(c) => *c,
+            ColorScheme::Split(a, b) => {
+                if index < num_leds / 2 { *a } else { *b }
+            }
+            ColorScheme::Rainbow { hue, .. } => {
+                let offset = if num_leds == 0 {
+                    0
+                } else {
+                    (index * 256 / num_leds) as u8
+                };
+                hsv2rgb(Hsv {
+                    hue: hue.wrapping_add(offset),
+                    sat: 255,
+                    val: 255,
+                })
+            }
+        }
+    }
+
+    /// Advance time-dependent state (e.g. rainbow hue rotation).
+    pub fn tick(&mut self) {
+        if let ColorScheme::Rainbow { hue, speed } = self {
+            *hue = hue.wrapping_add(*speed);
+        }
+    }
+
+    /// Update the hue rotation speed (only affects `Rainbow`).
+    pub fn set_hue_speed(&mut self, new_speed: u8) {
+        if let ColorScheme::Rainbow { speed, .. } = self {
+            *speed = new_speed;
+        }
     }
 }
 
-impl Default for RainbowCycle {
+// ---------------------------------------------------------------------------
+// Animation trait
+// ---------------------------------------------------------------------------
+
+/// An animation that renders frames into an LED buffer using a color scheme.
+pub trait Animation {
+    /// Render the next frame into the provided LED buffer.
+    fn render(&mut self, leds: &mut [RGB8], colors: &mut ColorScheme);
+}
+
+// ---------------------------------------------------------------------------
+// Static animation (no motion)
+// ---------------------------------------------------------------------------
+
+/// Fills LEDs with colors from the scheme, advancing the scheme each frame.
+pub struct StaticAnim;
+
+impl Animation for StaticAnim {
+    fn render(&mut self, leds: &mut [RGB8], colors: &mut ColorScheme) {
+        let num = leds.len();
+        for (i, led) in leds.iter_mut().enumerate() {
+            *led = colors.color_at(i, num);
+        }
+        colors.tick();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pulse animation (sinusoidal breathing)
+// ---------------------------------------------------------------------------
+
+/// Smooth sinusoidal breathing/pulsing of the entire strip.
+///
+/// Intensity follows a sine-like curve. Works with any color scheme.
+pub struct Pulse {
+    /// Phase accumulator in fixed-point (0–65535 maps to 0–2π).
+    phase: u16,
+    /// Phase increment per frame (controls speed).
+    speed: u16,
+    /// Minimum intensity floor (0.0–1.0). Pulse oscillates between this and 1.0.
+    min_intensity: f32,
+}
+
+impl Default for Pulse {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl RainbowCycle {
-    /// Update the hue increment per frame.
-    pub fn set_speed(&mut self, speed: u8) {
+impl Pulse {
+    /// Create a new `Pulse` with default parameters.
+    pub fn new() -> Self {
+        Self {
+            phase: 0,
+            speed: 600,
+            min_intensity: 0.4,
+        }
+    }
+
+    /// Update pulse speed and minimum intensity floor.
+    pub fn set_params(&mut self, speed: u16, min_intensity: f32) {
         self.speed = speed;
+        self.min_intensity = min_intensity.clamp(0.0, 1.0);
     }
 }
 
-impl Pattern for RainbowCycle {
-    fn render(&mut self, leds: &mut [RGB8]) {
-        let len = leds.len();
+impl Animation for Pulse {
+    fn render(&mut self, leds: &mut [RGB8], colors: &mut ColorScheme) {
+        self.phase = self.phase.wrapping_add(self.speed);
+
+        let half = if self.phase < 32768 {
+            self.phase
+        } else {
+            65535 - self.phase
+        };
+        // Cubic falloff: spends most time dim, snaps quickly to bright
+        let t = half as f32 / 32767.0;
+        let intensity = self.min_intensity + (1.0 - self.min_intensity) * t * t * t;
+
+        let num = leds.len();
         for (i, led) in leds.iter_mut().enumerate() {
-            *led = hsv2rgb(Hsv {
-                hue: self.hue.wrapping_add((i * 256 / len) as u8),
-                sat: 255,
-                val: 255,
-            });
+            let c = colors.color_at(i, num);
+            *led = RGB8 {
+                r: (c.r as f32 * intensity) as u8,
+                g: (c.g as f32 * intensity) as u8,
+                b: (c.b as f32 * intensity) as u8,
+            };
         }
-        self.hue = self.hue.wrapping_add(self.speed);
     }
 }
 
@@ -73,7 +174,7 @@ struct Ripple {
     radius: f32,
     /// Brightness multiplier, decays each frame.
     amplitude: f32,
-    /// Pre-computed RGB color (random hue at spawn).
+    /// Pre-computed RGB color (inherited from color scheme at spawn).
     color: RGB8,
 }
 
@@ -100,9 +201,9 @@ impl Xorshift32 {
 
 /// Particle-based expanding rings on a ring topology.
 ///
-/// Ripples spawn at random positions, expand outward, fade over time, and
-/// composite additively onto a deep navy background. The effect resembles
-/// colored stones dropping into dark water.
+/// Ripples spawn at random positions, inherit their color from the active
+/// color scheme at their origin position, expand outward, fade over time,
+/// and composite additively onto a black background.
 pub struct RippleEffect {
     ripples: [Ripple; MAX_RIPPLES],
     count: usize,
@@ -146,14 +247,13 @@ impl RippleEffect {
         self.decay = decay.clamp(0.0, 1.0);
     }
 
-    /// Spawn a new ripple at a random position with a random hue.
-    fn spawn(&mut self, num_leds: u8) {
+    /// Spawn a new ripple at a random position, inheriting color from the scheme.
+    fn spawn(&mut self, num_leds: u8, colors: &ColorScheme) {
         if self.count >= MAX_RIPPLES {
             return;
         }
         let origin = (self.rng.next() % num_leds as u32) as u8;
-        let hue = self.rng.next() as u8;
-        let color = hsv2rgb(Hsv { hue, sat: 230, val: 255 }); // S≈0.9, V=1.0
+        let color = colors.color_at(origin as usize, num_leds as usize);
         self.ripples[self.count] = Ripple {
             origin,
             radius: 0.0,
@@ -186,13 +286,13 @@ fn lerp_rgb(bg: RGB8, fg: RGB8, t: f32) -> RGB8 {
     }
 }
 
-impl Pattern for RippleEffect {
-    fn render(&mut self, leds: &mut [RGB8]) {
+impl Animation for RippleEffect {
+    fn render(&mut self, leds: &mut [RGB8], colors: &mut ColorScheme) {
         let num_leds = leds.len() as u8;
 
-        // Maybe spawn a new ripple
+        // Maybe spawn a new ripple (color inherited from scheme)
         if self.rng.next() < self.spawn_threshold {
-            self.spawn(num_leds);
+            self.spawn(num_leds, colors);
         }
 
         // Update existing ripples
@@ -230,164 +330,9 @@ impl Pattern for RippleEffect {
                 }
             }
         }
-    }
-}
 
-// ---------------------------------------------------------------------------
-// Sinusoidal pulse
-// ---------------------------------------------------------------------------
-
-/// Smooth sinusoidal breathing/pulsing of the entire strip in a single color.
-///
-/// Intensity follows a sine wave from 0 to full value and back.
-/// Useful for status indicators (e.g. "arming allowed" in green).
-pub struct SinePulse {
-    /// Base color at full intensity (hue/saturation preserved, value modulated).
-    color: RGB8,
-    /// Phase accumulator in fixed-point (0–65535 maps to 0–2π).
-    phase: u16,
-    /// Phase increment per frame (controls speed).
-    speed: u16,
-    /// Minimum intensity floor (0.0–1.0). Pulse oscillates between this and 1.0.
-    min_intensity: f32,
-}
-
-impl SinePulse {
-    /// Create a new `SinePulse` with the given color and speed.
-    ///
-    /// `speed` is the phase increment per frame in 16-bit fixed-point.
-    /// At 100 FPS, a speed of 400 gives a ~1.6 s full cycle.
-    pub fn new(color: RGB8, speed: u16, min_intensity: f32) -> Self {
-        Self {
-            color,
-            phase: 0,
-            speed,
-            min_intensity: min_intensity.clamp(0.0, 1.0),
-        }
-    }
-
-    /// Update pulse speed and minimum intensity floor.
-    pub fn set_params(&mut self, speed: u16, min_intensity: f32) {
-        self.speed = speed;
-        self.min_intensity = min_intensity.clamp(0.0, 1.0);
-    }
-
-    /// Create a green sinusoidal pulse with default speed and 30% floor.
-    pub fn green() -> Self {
-        Self::new(RGB8 { r: 0, g: 204, b: 0 }, 600, 0.3)
-    }
-}
-
-impl Pattern for SinePulse {
-    fn render(&mut self, leds: &mut [RGB8]) {
-        // Advance phase (wraps naturally at u16::MAX)
-        self.phase = self.phase.wrapping_add(self.speed);
-
-        // Approximate sin using a parabolic curve on 0–65535:
-        //   triangle: fold phase into 0–32767–0 range
-        //   then square for smooth sine-like shape
-        let half = if self.phase < 32768 {
-            self.phase
-        } else {
-            65535 - self.phase
-        };
-        // Cubic falloff: spends most time dim, snaps quickly to bright
-        let t = half as f32 / 32767.0;
-        let intensity = self.min_intensity + (1.0 - self.min_intensity) * t * t * t;
-
-        let r = (self.color.r as f32 * intensity) as u8;
-        let g = (self.color.g as f32 * intensity) as u8;
-        let b = (self.color.b as f32 * intensity) as u8;
-        let c = RGB8 { r, g, b };
-
-        for led in leds.iter_mut() {
-            *led = c;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Split pulse (two halves, two colors)
-// ---------------------------------------------------------------------------
-
-/// Sinusoidal pulse split into two halves, each with its own color.
-///
-/// The first half of the strip pulses in one color, the second half in another.
-/// Both halves share the same phase and speed.
-pub struct SplitPulse {
-    /// Color for the first half of the strip.
-    color_a: RGB8,
-    /// Color for the second half of the strip.
-    color_b: RGB8,
-    /// Phase accumulator in fixed-point (0–65535 maps to 0–2π).
-    phase: u16,
-    /// Phase increment per frame.
-    speed: u16,
-    /// Minimum intensity floor (0.0–1.0).
-    min_intensity: f32,
-}
-
-impl SplitPulse {
-    /// Create a new `SplitPulse` with the given colors, speed, and floor.
-    pub fn new(color_a: RGB8, color_b: RGB8, speed: u16, min_intensity: f32) -> Self {
-        Self {
-            color_a,
-            color_b,
-            phase: 0,
-            speed,
-            min_intensity: min_intensity.clamp(0.0, 1.0),
-        }
-    }
-
-    /// Update pulse speed and minimum intensity floor.
-    pub fn set_params(&mut self, speed: u16, min_intensity: f32) {
-        self.speed = speed;
-        self.min_intensity = min_intensity.clamp(0.0, 1.0);
-    }
-
-    /// Green front half, red rear half, default speed and 40% floor.
-    pub fn green_red() -> Self {
-        Self::new(
-            RGB8 { r: 0, g: 204, b: 0 },
-            RGB8 { r: 204, g: 0, b: 0 },
-            600,
-            0.4,
-        )
-    }
-}
-
-impl Pattern for SplitPulse {
-    fn render(&mut self, leds: &mut [RGB8]) {
-        self.phase = self.phase.wrapping_add(self.speed);
-
-        let half = if self.phase < 32768 {
-            self.phase
-        } else {
-            65535 - self.phase
-        };
-        // Cubic falloff: spends most time dim, snaps quickly to bright
-        let t = half as f32 / 32767.0;
-        let intensity = self.min_intensity + (1.0 - self.min_intensity) * t * t * t;
-
-        let mid = leds.len() / 2;
-
-        let apply = |color: RGB8| -> RGB8 {
-            RGB8 {
-                r: (color.r as f32 * intensity) as u8,
-                g: (color.g as f32 * intensity) as u8,
-                b: (color.b as f32 * intensity) as u8,
-            }
-        };
-
-        let ca = apply(self.color_a);
-        let cb = apply(self.color_b);
-
-        for led in &mut leds[..mid] {
-            *led = ca;
-        }
-        for led in &mut leds[mid..] {
-            *led = cb;
-        }
+        // Advance color scheme (e.g. rainbow rotation) so ripple colors evolve
+        colors.tick();
     }
 }
 
@@ -396,16 +341,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rainbow_cycle_advances_hue() {
-        let mut pattern = RainbowCycle::new();
-        let mut buf = [RGB8 { r: 0, g: 0, b: 0 }; 4];
+    fn color_scheme_solid() {
+        let c = ColorScheme::Solid(RGB8 { r: 0, g: 204, b: 0 });
+        assert_eq!(c.color_at(0, 10), RGB8 { r: 0, g: 204, b: 0 });
+        assert_eq!(c.color_at(9, 10), RGB8 { r: 0, g: 204, b: 0 });
+    }
 
-        pattern.render(&mut buf);
-        let first = buf[0];
+    #[test]
+    fn color_scheme_split() {
+        let green = RGB8 { r: 0, g: 204, b: 0 };
+        let red = RGB8 { r: 204, g: 0, b: 0 };
+        let c = ColorScheme::Split(green, red);
+        assert_eq!(c.color_at(0, 10), green);
+        assert_eq!(c.color_at(4, 10), green);
+        assert_eq!(c.color_at(5, 10), red);
+        assert_eq!(c.color_at(9, 10), red);
+    }
 
-        pattern.render(&mut buf);
-        // Hue shifted by 1, so color should differ
-        assert_ne!(buf[0], first);
+    #[test]
+    fn color_scheme_rainbow_varies() {
+        let c = ColorScheme::Rainbow { hue: 0, speed: 1 };
+        let a = c.color_at(0, 10);
+        let b = c.color_at(5, 10);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn color_scheme_tick_advances_rainbow() {
+        let mut c = ColorScheme::Rainbow { hue: 0, speed: 5 };
+        let before = match c { ColorScheme::Rainbow { hue, .. } => hue, _ => unreachable!() };
+        c.tick();
+        let after = match c { ColorScheme::Rainbow { hue, .. } => hue, _ => unreachable!() };
+        assert_eq!(after, before + 5);
     }
 
     #[test]
@@ -425,12 +392,9 @@ mod tests {
     fn ripple_starts_with_background() {
         let mut pattern = RippleEffect::new(42);
         let mut buf = [RGB8 { r: 0, g: 0, b: 0 }; 10];
+        let mut colors = ColorScheme::Solid(RGB8 { r: 255, g: 0, b: 0 });
 
-        // With spawn probability ~2%, first frame may or may not spawn.
-        // But the background should be set.
-        pattern.render(&mut buf);
-        // At minimum, LEDs without a ripple should be the background color.
-        // We verify at least one LED is the background.
+        pattern.render(&mut buf, &mut colors);
         assert!(buf.iter().any(|c| *c == BACKGROUND));
     }
 
@@ -438,6 +402,7 @@ mod tests {
     fn ripple_dead_ripples_removed() {
         let mut pattern = RippleEffect::new(42);
         let mut buf = [RGB8 { r: 0, g: 0, b: 0 }; 20];
+        let mut colors = ColorScheme::Solid(RGB8 { r: 255, g: 0, b: 0 });
 
         // Force-spawn a ripple with very low amplitude
         pattern.ripples[0] = Ripple {
@@ -448,8 +413,7 @@ mod tests {
         };
         pattern.count = 1;
 
-        pattern.render(&mut buf);
-        // After render, the dead ripple should have been removed
+        pattern.render(&mut buf, &mut colors);
         assert_eq!(pattern.count, 0);
     }
 
@@ -471,5 +435,29 @@ mod tests {
         for _ in 0..1000 {
             assert_ne!(rng.next(), 0);
         }
+    }
+
+    #[test]
+    fn pulse_renders_with_color_scheme() {
+        let mut pulse = Pulse::new();
+        let mut buf = [RGB8 { r: 0, g: 0, b: 0 }; 10];
+        let mut colors = ColorScheme::Solid(RGB8 { r: 0, g: 204, b: 0 });
+
+        pulse.render(&mut buf, &mut colors);
+        // All LEDs should be the same (solid color + uniform pulse)
+        assert!(buf.windows(2).all(|w| w[0] == w[1]));
+    }
+
+    #[test]
+    fn static_anim_fills_from_scheme() {
+        let mut anim = StaticAnim;
+        let mut buf = [RGB8 { r: 0, g: 0, b: 0 }; 10];
+        let green = RGB8 { r: 0, g: 204, b: 0 };
+        let red = RGB8 { r: 204, g: 0, b: 0 };
+        let mut colors = ColorScheme::Split(green, red);
+
+        anim.render(&mut buf, &mut colors);
+        assert_eq!(buf[0], green);
+        assert_eq!(buf[9], red);
     }
 }

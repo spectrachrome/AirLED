@@ -9,16 +9,29 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Added
 
-- Per-pattern parameter sliders in web UI (pulse speed, min brightness, ripple speed/width/decay, hue speed)
-- `PatternParams` enum in `src/state.rs` with `default_for()` helper for mode-aware defaults
-- `set_params()` / `set_speed()` methods on all pattern structs for live parameter updates
-- JS visibility logic: per-pattern sliders show/hide based on selected mode
+- Two independent axes: `ColorScheme` (solid green, solid red, split, rainbow) × `Animation` (static, pulse, ripple) for 12 combinations
+- `ColorScheme` enum in `src/pattern.rs` with `color_at()`, `tick()`, and `set_hue_speed()`
+- `Animation` trait replacing `Pattern` trait — `render(&mut self, leds, colors)`
+- `StaticAnim` animation (fills LEDs from color scheme, no motion)
+- `Pulse` animation (merged `SplitPulse` + `SinePulse` — works with any color scheme)
+- Ripples now inherit color from the active color scheme at their origin position
+- Two dropdown selectors in web UI: "Color" and "Animation" (independently selectable)
+- `ColorMode`, `AnimMode`, `ColorModeParams`, `AnimModeParams` in `src/state.rs`
+- Per-axis param slider visibility: `data-color` and `data-anim` attributes checked independently
 
 ### Changed
 
-- Mode changes in the web UI now reset pattern parameters to defaults
-- `led_task` applies live parameters from shared state each frame before rendering
-- `parse_query_params()` handles new per-pattern keys and mode-change param resets
+- Animation mode changes in web UI reset animation params to defaults
+- `led_task` maintains a `ColorScheme` instance, rebuilds on color mode change
+- `parse_query_params()` uses `color=...&anim=...` query keys instead of `mode=...`
+
+### Removed
+
+- `PatternMode` and `PatternParams` enums (replaced by `ColorMode`/`AnimMode` axes)
+- `Pattern` trait (replaced by `Animation` trait with color scheme parameter)
+- `SplitPulse`, `SinePulse`, `RainbowCycle` structs (merged into `Pulse`/`StaticAnim` + `ColorScheme`)
+- Single "Mode" dropdown in web UI (replaced by separate "Color" and "Animation" dropdowns)
+
 - Post-processing pipeline (`src/postfx.rs`) with composable `PostEffect` enum: `Brightness`, `Gamma`, `CurrentLimit`
 - Gamma 2.6 correction via 256-byte LUT (Adafruit gamma8 table)
 - SPI+DMA LED driver via `ws2812-spi` (replaces RMT, supports 200+ LEDs)
