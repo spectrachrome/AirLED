@@ -52,8 +52,8 @@ impl Pattern for RainbowCycle {
 /// Maximum number of concurrently active ripples.
 const MAX_RIPPLES: usize = 20;
 
-/// Deep navy background color.
-const BACKGROUND: RGB8 = RGB8 { r: 0, g: 4, b: 34 };
+/// Background color (black).
+const BACKGROUND: RGB8 = RGB8 { r: 0, g: 0, b: 0 };
 
 /// A single expanding ring ripple.
 #[derive(Clone, Copy)]
@@ -111,8 +111,8 @@ pub struct RippleEffect {
 impl RippleEffect {
     /// Create a new `RippleEffect` with the given PRNG seed.
     pub fn new(seed: u32) -> Self {
-        // 0.02 probability ≈ 0.02 * u32::MAX
-        let spawn_threshold = (0.02_f64 * u32::MAX as f64) as u32;
+        // 0.06 probability ≈ 0.06 * u32::MAX
+        let spawn_threshold = (0.06_f64 * u32::MAX as f64) as u32;
 
         Self {
             ripples: [Ripple {
@@ -213,6 +213,151 @@ impl Pattern for RippleEffect {
                     *led = lerp_rgb(*led, ripple.color, bright);
                 }
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sinusoidal pulse
+// ---------------------------------------------------------------------------
+
+/// Smooth sinusoidal breathing/pulsing of the entire strip in a single color.
+///
+/// Intensity follows a sine wave from 0 to full value and back.
+/// Useful for status indicators (e.g. "arming allowed" in green).
+pub struct SinePulse {
+    /// Base color at full intensity (hue/saturation preserved, value modulated).
+    color: RGB8,
+    /// Phase accumulator in fixed-point (0–65535 maps to 0–2π).
+    phase: u16,
+    /// Phase increment per frame (controls speed).
+    speed: u16,
+    /// Minimum intensity floor (0.0–1.0). Pulse oscillates between this and 1.0.
+    min_intensity: f32,
+}
+
+impl SinePulse {
+    /// Create a new `SinePulse` with the given color and speed.
+    ///
+    /// `speed` is the phase increment per frame in 16-bit fixed-point.
+    /// At 100 FPS, a speed of 400 gives a ~1.6 s full cycle.
+    pub fn new(color: RGB8, speed: u16, min_intensity: f32) -> Self {
+        Self {
+            color,
+            phase: 0,
+            speed,
+            min_intensity: min_intensity.clamp(0.0, 1.0),
+        }
+    }
+
+    /// Create a green sinusoidal pulse with default speed and 10% floor.
+    pub fn green() -> Self {
+        Self::new(RGB8 { r: 0, g: 204, b: 0 }, 600, 0.1)
+    }
+}
+
+impl Pattern for SinePulse {
+    fn render(&mut self, leds: &mut [RGB8]) {
+        // Advance phase (wraps naturally at u16::MAX)
+        self.phase = self.phase.wrapping_add(self.speed);
+
+        // Approximate sin using a parabolic curve on 0–65535:
+        //   triangle: fold phase into 0–32767–0 range
+        //   then square for smooth sine-like shape
+        let half = if self.phase < 32768 {
+            self.phase
+        } else {
+            65535 - self.phase
+        };
+        // Normalize to 0.0–1.0 and apply squared curve for smoothness
+        let t = half as f32 / 32767.0;
+        let intensity = self.min_intensity + (1.0 - self.min_intensity) * t * t;
+
+        let r = (self.color.r as f32 * intensity) as u8;
+        let g = (self.color.g as f32 * intensity) as u8;
+        let b = (self.color.b as f32 * intensity) as u8;
+        let c = RGB8 { r, g, b };
+
+        for led in leds.iter_mut() {
+            *led = c;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Split pulse (two halves, two colors)
+// ---------------------------------------------------------------------------
+
+/// Sinusoidal pulse split into two halves, each with its own color.
+///
+/// The first half of the strip pulses in one color, the second half in another.
+/// Both halves share the same phase and speed.
+pub struct SplitPulse {
+    /// Color for the first half of the strip.
+    color_a: RGB8,
+    /// Color for the second half of the strip.
+    color_b: RGB8,
+    /// Phase accumulator in fixed-point (0–65535 maps to 0–2π).
+    phase: u16,
+    /// Phase increment per frame.
+    speed: u16,
+    /// Minimum intensity floor (0.0–1.0).
+    min_intensity: f32,
+}
+
+impl SplitPulse {
+    /// Create a new `SplitPulse` with the given colors, speed, and floor.
+    pub fn new(color_a: RGB8, color_b: RGB8, speed: u16, min_intensity: f32) -> Self {
+        Self {
+            color_a,
+            color_b,
+            phase: 0,
+            speed,
+            min_intensity: min_intensity.clamp(0.0, 1.0),
+        }
+    }
+
+    /// Green front half, red rear half, default speed and 10% floor.
+    pub fn green_red() -> Self {
+        Self::new(
+            RGB8 { r: 0, g: 204, b: 0 },
+            RGB8 { r: 204, g: 0, b: 0 },
+            600,
+            0.1,
+        )
+    }
+}
+
+impl Pattern for SplitPulse {
+    fn render(&mut self, leds: &mut [RGB8]) {
+        self.phase = self.phase.wrapping_add(self.speed);
+
+        let half = if self.phase < 32768 {
+            self.phase
+        } else {
+            65535 - self.phase
+        };
+        let t = half as f32 / 32767.0;
+        let intensity = self.min_intensity + (1.0 - self.min_intensity) * t * t;
+
+        let mid = leds.len() / 2;
+
+        let apply = |color: RGB8| -> RGB8 {
+            RGB8 {
+                r: (color.r as f32 * intensity) as u8,
+                g: (color.g as f32 * intensity) as u8,
+                b: (color.b as f32 * intensity) as u8,
+            }
+        };
+
+        let ca = apply(self.color_a);
+        let cb = apply(self.color_b);
+
+        for led in &mut leds[..mid] {
+            *led = ca;
+        }
+        for led in &mut leds[mid..] {
+            *led = cb;
         }
     }
 }

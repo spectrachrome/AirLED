@@ -4,7 +4,7 @@ Firmware for a Seeed XIAO ESP32-C3 that drives a WS2812 LED strip on an FPV dron
 
 ## Features
 
-- **WS2812 LED strip** driven via RMT peripheral (150 LEDs, configurable)
+- **WS2812 LED strip** driven via SPI+DMA (`ws2812-spi`) on GPIO10 (200 LEDs, configurable)
 - **Modular pattern engine** — `Pattern` trait with swappable implementations
   - `RippleEffect` (default) — expanding ring particles with random hues on a deep navy background
   - `RainbowCycle` — classic hue-shifting rainbow
@@ -15,7 +15,7 @@ Firmware for a Seeed XIAO ESP32-C3 that drives a WS2812 LED strip on an FPV dron
 ## Hardware
 
 - Seeed XIAO ESP32-C3
-- WS2812B LED strip on GPIO2
+- WS2812B LED strip on GPIO10 (SPI2 MOSI)
 - USB power (2A budget)
 
 ## Building
@@ -49,7 +49,7 @@ Updates LED parameters via query string. Returns `204 No Content`.
 | Parameter    | Type | Range   | Description                  |
 |--------------|------|---------|------------------------------|
 | `brightness` | int  | 0–255   | Global brightness level      |
-| `num_leds`   | int  | 1–150   | Number of active LEDs driven |
+| `num_leds`   | int  | 1–200   | Number of active LEDs driven |
 | `fps`        | int  | 1–150   | Animation frame rate         |
 
 Both parameters are optional and can be combined.

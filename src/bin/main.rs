@@ -11,17 +11,23 @@ use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_time::{Duration, Timer};
 use embedded_io_async::Write;
 use esp_hal::clock::CpuClock;
+use esp_hal::dma::{DmaRxBuf, DmaTxBuf};
+use esp_hal::dma_buffers;
 use esp_hal::interrupt::software::SoftwareInterruptControl;
-use esp_hal::rmt::Rmt;
+use esp_hal::spi::master::{Config as SpiConfig, Spi, SpiDmaBus};
+use esp_hal::spi::Mode;
+use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
-use esp_hal_smartled::Ws2812SmartLeds;
 use esp_radio::wifi::{
     AccessPointConfig, ModeConfig, WifiApState, ap_state,
 };
 use panic_rtt_target as _;
 use smart_leds::{SmartLedsWrite, brightness, RGB8};
-use xiao_drone_led_controller::pattern::{Pattern, RippleEffect};
-use xiao_drone_led_controller::state::STATE;
+use ws2812_spi::prerendered::Ws2812;
+use xiao_drone_led_controller::pattern::{
+    Pattern, RainbowCycle, RippleEffect, SinePulse, SplitPulse,
+};
+use xiao_drone_led_controller::state::{PatternMode, STATE};
 use static_cell::StaticCell;
 
 extern crate alloc;
@@ -30,13 +36,13 @@ esp_bootloader_esp_idf::esp_app_desc!();
 use alloc::string::ToString;
 
 /// Maximum number of WS2812 LEDs supported (compile-time buffer size).
-const MAX_LEDS: usize = 150;
+const MAX_LEDS: usize = 200;
 
-/// RMT buffer size: 24 bits per LED (8 per channel * 3 channels) + 1 end marker.
-const BUFFER_SIZE: usize = MAX_LEDS * 24 + 1;
+/// SPI pre-rendered buffer size for ws2812-spi (4 SPI bytes per 2 data bits × 12 per LED).
+const SPI_BUF_LEN: usize = MAX_LEDS * 12;
 
 /// Wi-Fi AP SSID.
-const WIFI_SSID: &str = "XIAO-LED-Controller";
+const WIFI_SSID: &str = "DroneLED";
 
 /// AP static IP address.
 const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
@@ -60,13 +66,20 @@ fn main() -> ! {
     let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
-    // --- LED setup ---
-    let rmt = Rmt::new(peripherals.RMT, esp_hal::time::Rate::from_mhz(80))
-        .expect("failed to initialize RMT");
+    // --- LED setup (SPI + DMA) ---
+    let (rx_buf, rx_desc, tx_buf, tx_desc) = dma_buffers!(SPI_BUF_LEN);
+    let dma_rx = DmaRxBuf::new(rx_desc, rx_buf).expect("failed to create DMA RX buf");
+    let dma_tx = DmaTxBuf::new(tx_desc, tx_buf).expect("failed to create DMA TX buf");
 
-    let led_driver =
-        Ws2812SmartLeds::<BUFFER_SIZE, _>::new(rmt.channel0, peripherals.GPIO2)
-            .expect("failed to create WS2812 driver");
+    let spi_config = SpiConfig::default()
+        .with_frequency(Rate::from_khz(3200))
+        .with_mode(Mode::_0);
+
+    let spi_bus = Spi::new(peripherals.SPI2, spi_config)
+        .expect("failed to create SPI")
+        .with_mosi(peripherals.GPIO10)
+        .with_dma(peripherals.DMA_CH0)
+        .with_buffers(dma_rx, dma_tx);
 
     // --- Wi-Fi setup (scheduler is now running) ---
     static RADIO: StaticCell<esp_radio::Controller<'static>> = StaticCell::new();
@@ -108,7 +121,7 @@ fn main() -> ! {
     static EXECUTOR: StaticCell<esp_rtos::embassy::Executor> = StaticCell::new();
     let executor = EXECUTOR.init(esp_rtos::embassy::Executor::new());
     executor.run(move |spawner| {
-        spawner.must_spawn(led_task(led_driver));
+        spawner.must_spawn(led_task(spi_bus));
         spawner.must_spawn(net_task(runner));
         spawner.must_spawn(web_server(stack));
         spawner.must_spawn(dhcp_server(stack));
@@ -162,10 +175,15 @@ fn clamp_brightness(buf: &[RGB8], brightness: u8, max_ma: u32) -> u8 {
     }
 }
 
-/// Drives the WS2812 LED strip using the active pattern.
+/// Drives the WS2812 LED strip using the active pattern via SPI+DMA.
 #[embassy_executor::task]
-async fn led_task(mut driver: Ws2812SmartLeds<'static, BUFFER_SIZE, esp_hal::Blocking>) {
-    let mut pattern = RippleEffect::new(0xDEAD_BEEF);
+async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
+    let mut ws_buf = [0u8; SPI_BUF_LEN];
+    let mut ws = Ws2812::new(spi_bus, &mut ws_buf);
+    let mut split_pulse = SplitPulse::green_red();
+    let mut green_pulse = SinePulse::green();
+    let mut ripple = RippleEffect::new(0xDEAD_BEEF);
+    let mut rainbow = RainbowCycle::new();
     let mut buf = [RGB8 { r: 0, g: 0, b: 0 }; MAX_LEDS];
     let mut write_err_logged = false;
 
@@ -175,17 +193,22 @@ async fn led_task(mut driver: Ws2812SmartLeds<'static, BUFFER_SIZE, esp_hal::Blo
         let led_brightness = state.brightness;
         let max_ma = state.max_current_ma;
         let fps = state.fps.max(1);
+        let mode = state.pattern;
         drop(state);
 
         let active = &mut buf[..num_leds];
-        pattern.render(active);
+        match mode {
+            PatternMode::SplitPulse => split_pulse.render(active),
+            PatternMode::GreenPulse => green_pulse.render(active),
+            PatternMode::Ripple => ripple.render(active),
+            PatternMode::Rainbow => rainbow.render(active),
+        }
 
         let clamped = clamp_brightness(active, led_brightness, max_ma);
 
-        match driver.write(brightness(active.iter().copied(), clamped)) {
+        match ws.write(brightness(active.iter().copied(), clamped)) {
             Err(e) if !write_err_logged => {
                 defmt::warn!("LED write error: {}", defmt::Debug2Format(&e));
-                defmt::warn!("Check MAX_LEDS — ESP32-C3 RMT supports up to ~150 LEDs");
                 write_err_logged = true;
             }
             Ok(_) if write_err_logged => {
@@ -290,14 +313,38 @@ fn parse_query_params(query: &str, state: &mut xiao_drone_led_controller::state:
                         state.fps = v.clamp(1, 150);
                     }
                 }
+                "mode" => {
+                    state.pattern = match value {
+                        "split" => PatternMode::SplitPulse,
+                        "green" => PatternMode::GreenPulse,
+                        "ripple" => PatternMode::Ripple,
+                        "rainbow" => PatternMode::Rainbow,
+                        _ => state.pattern,
+                    };
+                }
                 _ => {}
             }
         }
     }
 }
 
+/// Map a `PatternMode` to its query-string key.
+fn mode_key(mode: PatternMode) -> &'static str {
+    match mode {
+        PatternMode::SplitPulse => "split",
+        PatternMode::GreenPulse => "green",
+        PatternMode::Ripple => "ripple",
+        PatternMode::Rainbow => "rainbow",
+    }
+}
+
 /// Build the HTML control page with current state values injected.
-fn build_html_page(brightness: u8, num_leds: u16, fps: u8) -> alloc::string::String {
+fn build_html_page(brightness: u8, num_leds: u16, fps: u8, mode: PatternMode) -> alloc::string::String {
+    let sel = |key| if mode_key(mode) == key { " selected" } else { "" };
+    let sel_split = sel("split");
+    let sel_green = sel("green");
+    let sel_ripple = sel("ripple");
+    let sel_rainbow = sel("rainbow");
     alloc::format!(
         r#"<!DOCTYPE html>
 <html>
@@ -309,11 +356,19 @@ body{{font-family:sans-serif;max-width:480px;margin:20px auto;padding:0 16px}}
 h1{{font-size:1.4em}}
 label{{display:block;margin:16px 0 4px;font-weight:bold}}
 input[type=range]{{width:100%}}
+select{{width:100%;padding:6px;font-size:1em}}
 .val{{font-size:1.2em;color:#06c}}
 </style>
 </head>
 <body>
 <h1>XIAO LED Controller</h1>
+<label>Mode:</label>
+<select id="md">
+<option value="split"{sel_split}>Split Pulse (Green/Red)</option>
+<option value="green"{sel_green}>Green Pulse</option>
+<option value="ripple"{sel_ripple}>Ripple</option>
+<option value="rainbow"{sel_rainbow}>Rainbow</option>
+</select>
 <label>Brightness: <span id="bv" class="val">{brightness}</span></label>
 <input type="range" id="br" min="0" max="255" value="{brightness}">
 <label>LED Count: <span id="lv" class="val">{num_leds}</span></label>
@@ -321,13 +376,14 @@ input[type=range]{{width:100%}}
 <label>FPS: <span id="fv" class="val">{fps}</span></label>
 <input type="range" id="fp" min="1" max="150" value="{fps}">
 <script>
-var br=document.getElementById('br'),lc=document.getElementById('lc'),fp=document.getElementById('fp');
+var br=document.getElementById('br'),lc=document.getElementById('lc'),fp=document.getElementById('fp'),md=document.getElementById('md');
 var bv=document.getElementById('bv'),lv=document.getElementById('lv'),fv=document.getElementById('fv');
 var t;
-function send(){{fetch('/set?brightness='+br.value+'&num_leds='+lc.value+'&fps='+fp.value)}}
+function send(){{fetch('/set?brightness='+br.value+'&num_leds='+lc.value+'&fps='+fp.value+'&mode='+md.value)}}
 br.oninput=function(){{bv.textContent=br.value;clearTimeout(t);t=setTimeout(send,80)}};
 lc.oninput=function(){{lv.textContent=lc.value;clearTimeout(t);t=setTimeout(send,80)}};
 fp.oninput=function(){{fv.textContent=fp.value;clearTimeout(t);t=setTimeout(send,80)}};
+md.onchange=function(){{send()}};
 </script>
 </body>
 </html>"#,
@@ -335,6 +391,10 @@ fp.oninput=function(){{fv.textContent=fp.value;clearTimeout(t);t=setTimeout(send
         num_leds = num_leds,
         max_leds = MAX_NUM_LEDS,
         fps = fps,
+        sel_split = sel_split,
+        sel_green = sel_green,
+        sel_ripple = sel_ripple,
+        sel_rainbow = sel_rainbow,
     )
 }
 
@@ -391,7 +451,7 @@ async fn web_server(stack: Stack<'static>) {
         } else {
             // Serve the control page with current values
             let state = STATE.lock().await;
-            let page = build_html_page(state.brightness, state.num_leds, state.fps);
+            let page = build_html_page(state.brightness, state.num_leds, state.fps, state.pattern);
             drop(state);
 
             let header = alloc::format!(

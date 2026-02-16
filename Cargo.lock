@@ -782,17 +782,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "esp-hal-smartled2"
-version = "0.28.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1a00c36869076635bf254dee6f78ac8b9d3fa71541470538a8fffbdb626d120"
-dependencies = [
- "esp-hal",
- "num-traits",
- "smart-leds-trait",
-]
-
-[[package]]
 name = "esp-metadata-generated"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1968,6 +1957,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ws2812-spi"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2fd98e2b649252eced2ec3aa8d5048e7d2ac294276b0567939bbf47741f9934"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "smart-leds-trait",
+]
+
+[[package]]
 name = "xiao_drone_led_controller"
 version = "0.1.0"
 dependencies = [
@@ -1984,7 +1983,6 @@ dependencies = [
  "esp-alloc",
  "esp-bootloader-esp-idf",
  "esp-hal",
- "esp-hal-smartled2",
  "esp-radio",
  "esp-rtos",
  "heapless 0.8.0",
@@ -1993,6 +1991,7 @@ dependencies = [
  "smart-leds",
  "smoltcp",
  "static_cell",
+ "ws2812-spi",
 ]
 
 [[package]]

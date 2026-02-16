@@ -9,9 +9,10 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Added
 
-- Interactive web UI with brightness (0–255), LED count (1–150), and FPS (1–150) sliders
+- SPI+DMA LED driver via `ws2812-spi` (replaces RMT, supports 200+ LEDs)
+- Interactive web UI with brightness (0–255), LED count (1–200), and FPS (1–150) sliders
 - `/set` HTTP endpoint for real-time parameter updates via query params
-- Configurable `num_leds` field in `LedState` (default 150, max 150)
+- Configurable `num_leds` field in `LedState` (default 200, max 200)
 - Configurable `fps` field in `LedState` (default 50, range 1–150)
 - `Pattern` trait in `src/pattern.rs` for modular LED patterns
 - `RainbowCycle` pattern implementing `Pattern` trait
@@ -33,6 +34,10 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Changed
 
+- LED driver switched from RMT (`esp-hal-smartled2`) to SPI+DMA (`ws2812-spi`) on GPIO10 (MOSI)
+- `MAX_LEDS` increased from 150 to 200 (no longer constrained by RMT buffer)
+- Default `num_leds` changed from 150 to 200
+- Compiler `opt-level` changed from `"s"` to `3` for both dev and release profiles
 - `NUM_LEDS` renamed to `MAX_LEDS` (200) as compile-time buffer max; active count is now runtime-configurable
 - Static HTML test page replaced with interactive control UI
 - Web server tx_buffer increased to 4096 to fit HTML page
@@ -45,4 +50,5 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Removed
 
+- `esp-hal-smartled2` / RMT-based LED driver (replaced by SPI+DMA)
 - ws2812-esp32-rmt-driver (incompatible with bare-metal no_std)
