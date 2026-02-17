@@ -108,6 +108,8 @@ pub struct LedState {
     pub fps: u8,
     /// Maximum allowed strip current in milliamps.
     pub max_current_ma: u32,
+    /// Whether a flight controller is connected via MSP.
+    pub fc_connected: bool,
     /// Current flight mode (drives LED pattern selection).
     pub flight_mode: FlightMode,
     /// Active color scheme.
@@ -126,6 +128,12 @@ pub struct LedState {
     pub anim_mode: AnimMode,
     /// Animation-specific parameters.
     pub anim_params: AnimModeParams,
+    /// Raw MSP flight mode flags for LED-based debugging (0 = no debug data).
+    pub debug_flags: u32,
+    /// Index of the ARM box in the BOXNAMES map (255 = not found).
+    pub debug_arm_box: u8,
+    /// Index of the FAILSAFE box in the BOXNAMES map (255 = not found).
+    pub debug_failsafe_box: u8,
 }
 
 impl Default for LedState {
@@ -135,6 +143,7 @@ impl Default for LedState {
             num_leds: 180,
             fps: 100,
             max_current_ma: 2000,
+            fc_connected: false,
             flight_mode: FlightMode::ArmingForbidden,
             color_mode: ColorMode::Split,
             color_params: ColorModeParams::default(),
@@ -144,6 +153,9 @@ impl Default for LedState {
             use_hsi: false,
             anim_mode: AnimMode::Pulse,
             anim_params: AnimModeParams::default_for(AnimMode::Pulse),
+            debug_flags: 0,
+            debug_arm_box: 255,
+            debug_failsafe_box: 255,
         }
     }
 }
@@ -156,6 +168,7 @@ pub static STATE: Mutex<CriticalSectionRawMutex, LedState> = Mutex::new(LedState
     num_leds: 180,
     fps: 100,
     max_current_ma: 2000,
+    fc_connected: false,
     flight_mode: FlightMode::ArmingForbidden,
     color_mode: ColorMode::Split,
     color_params: ColorModeParams { hue_speed: 1 },
@@ -168,4 +181,7 @@ pub static STATE: Mutex<CriticalSectionRawMutex, LedState> = Mutex::new(LedState
         speed: 600,
         min_intensity_pct: 42,
     },
+    debug_flags: 0,
+    debug_arm_box: 255,
+    debug_failsafe_box: 255,
 });

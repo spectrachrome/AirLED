@@ -8,8 +8,8 @@ use edge_dhcp::server::{Server as DhcpServer, ServerOptions as DhcpServerOptions
 use edge_dhcp::{Options as DhcpOptions, Packet as DhcpPacket};
 use embassy_net::{Ipv4Address, Ipv4Cidr, Runner, Stack, StackResources, StaticConfigV4, tcp::TcpSocket};
 use embassy_net::udp::{PacketMetadata, UdpSocket};
-use embassy_time::{Duration, Timer};
-use embedded_io_async::Write;
+use embassy_time::{Duration, Timer, with_timeout};
+use embedded_io_async::{Read as AsyncRead, Write};
 use esp_hal::clock::CpuClock;
 use esp_hal::dma::{DmaRxBuf, DmaTxBuf};
 use esp_hal::dma_buffers;
@@ -18,17 +18,23 @@ use esp_hal::spi::master::{Config as SpiConfig, Spi, SpiDmaBus};
 use esp_hal::spi::Mode;
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
+use esp_hal::uart::{Config as UartConfig, Uart};
 use esp_radio::wifi::{
     AccessPointConfig, ModeConfig, WifiApState, ap_state,
 };
 use panic_rtt_target as _;
 use smart_leds::{SmartLedsWrite, RGB8};
 use ws2812_spi::prerendered::Ws2812;
+use xiao_drone_led_controller::msp::{
+    self, BoxId, MspParser, ParseResult,
+};
 use xiao_drone_led_controller::pattern::{
     Animation, ColorScheme, Pulse, RippleEffect, StaticAnim,
 };
 use xiao_drone_led_controller::postfx::{PostEffect, apply_pipeline};
-use xiao_drone_led_controller::state::{AnimMode, AnimModeParams, ColorMode, STATE};
+use xiao_drone_led_controller::state::{
+    AnimMode, AnimModeParams, ColorMode, FlightMode, STATE,
+};
 use static_cell::StaticCell;
 
 extern crate alloc;
@@ -118,11 +124,21 @@ fn main() -> ! {
         0, // random seed — no true randomness needed for AP
     );
 
+    // --- MSP UART setup ---
+    info!("Setting up MSP UART...");
+    let msp_uart = Uart::new(peripherals.UART0, UartConfig::default())
+        .expect("failed to create MSP UART")
+        .with_rx(peripherals.GPIO20)
+        .with_tx(peripherals.GPIO21)
+        .into_async();
+    info!("MSP UART ready");
+
     // Start embassy executor
     static EXECUTOR: StaticCell<esp_rtos::embassy::Executor> = StaticCell::new();
     let executor = EXECUTOR.init(esp_rtos::embassy::Executor::new());
     executor.run(move |spawner| {
         spawner.must_spawn(led_task(spi_bus));
+        spawner.must_spawn(msp_task(msp_uart));
         spawner.must_spawn(net_task(runner));
         spawner.must_spawn(web_server(stack));
         spawner.must_spawn(dhcp_server(stack));
@@ -146,6 +162,188 @@ async fn wifi_keepalive(wifi_controller: esp_radio::wifi::WifiController<'static
     }
 }
 
+/// Read bytes from UART until a complete MSP frame is parsed or timeout.
+async fn read_msp_response(
+    uart: &mut Uart<'static, esp_hal::Async>,
+    parser: &mut MspParser,
+    timeout: Duration,
+) -> Option<msp::MspFrame> {
+    parser.reset();
+    let fut = async {
+        let mut byte = [0u8; 1];
+        loop {
+            if AsyncRead::read(uart, &mut byte).await.is_err() {
+                return None;
+            }
+            match parser.feed(byte[0]) {
+                ParseResult::Incomplete => continue,
+                ParseResult::Frame(f) => return Some(f),
+                ParseResult::Error => return None,
+            }
+        }
+    };
+    with_timeout(timeout, fut).await.unwrap_or_default()
+}
+
+/// Polls the flight controller over MSP UART, updating shared state with
+/// the current flight mode.
+#[embassy_executor::task]
+async fn msp_task(mut uart: Uart<'static, esp_hal::Async>) {
+    info!("MSP task started");
+    let mut parser = MspParser::new();
+    let mut tx_buf = [0u8; 16];
+
+    // --- Phase 1: query BOXNAMES to build the box map ---
+    let mut box_map = [BoxId::Unknown; 48];
+    let mut got_boxnames = false;
+
+    // Try BOXIDS first (more reliable), then BOXNAMES as fallback.
+    info!("MSP: querying box map...");
+    let box_cmds = [msp::MSP_BOXIDS, msp::MSP_BOXNAMES];
+    'startup: for attempt in 0..10 {
+        for &cmd in &box_cmds {
+            let len = msp::build_request(cmd, &[], &mut tx_buf);
+            if Write::write_all(&mut uart, &tx_buf[..len]).await.is_err() {
+                continue;
+            }
+            if let Some(frame) =
+                read_msp_response(&mut uart, &mut parser, Duration::from_millis(500)).await
+            {
+                if frame.cmd == msp::MSP_BOXIDS {
+                    box_map = msp::parse_boxids(&frame.payload, frame.size);
+                    got_boxnames = true;
+                    info!("MSP: BOXIDS received (attempt {})", attempt + 1);
+                    break 'startup;
+                } else if frame.cmd == msp::MSP_BOXNAMES {
+                    box_map = msp::parse_boxnames(&frame.payload, frame.size);
+                    got_boxnames = true;
+                    info!("MSP: BOXNAMES received (attempt {})", attempt + 1);
+                    break 'startup;
+                }
+            }
+        }
+        Timer::after(Duration::from_millis(500)).await;
+    }
+
+    if got_boxnames {
+        let mut state = STATE.lock().await;
+        for (i, b) in box_map.iter().enumerate() {
+            match b {
+                BoxId::Arm => {
+                    state.debug_arm_box = i as u8;
+                    info!("MSP: box[{}] = ARM", i);
+                }
+                BoxId::Failsafe => {
+                    state.debug_failsafe_box = i as u8;
+                    info!("MSP: box[{}] = FAILSAFE", i);
+                }
+                _ => {}
+            }
+        }
+    } else {
+        info!("MSP: box map failed after 10 attempts, continuing with defaults");
+    }
+    info!("MSP: entering poll loop");
+
+    // --- Phase 2: poll MSP_STATUS at ~10 Hz ---
+    let mut error_count: u8 = 0;
+    let mut logged_raw_status = false;
+
+    loop {
+        // Retry box map if we never got it (FC wasn't ready at startup)
+        if !got_boxnames {
+            for &cmd in &[msp::MSP_BOXIDS, msp::MSP_BOXNAMES] {
+                let len = msp::build_request(cmd, &[], &mut tx_buf);
+                if Write::write_all(&mut uart, &tx_buf[..len]).await.is_ok() {
+                    if let Some(frame) =
+                        read_msp_response(&mut uart, &mut parser, Duration::from_millis(500)).await
+                    {
+                        if frame.cmd == msp::MSP_BOXIDS {
+                            box_map = msp::parse_boxids(&frame.payload, frame.size);
+                            got_boxnames = true;
+                        } else if frame.cmd == msp::MSP_BOXNAMES {
+                            box_map = msp::parse_boxnames(&frame.payload, frame.size);
+                            got_boxnames = true;
+                        }
+                        if got_boxnames {
+                            let mut state = STATE.lock().await;
+                            for (i, b) in box_map.iter().enumerate() {
+                                match b {
+                                    BoxId::Arm => {
+                                        state.debug_arm_box = i as u8;
+                                        info!("MSP: box[{}] = ARM", i);
+                                    }
+                                    BoxId::Failsafe => {
+                                        state.debug_failsafe_box = i as u8;
+                                        info!("MSP: box[{}] = FAILSAFE", i);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            info!("MSP: box map received (late)");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let len = msp::build_request(msp::MSP_STATUS, &[], &mut tx_buf);
+        let send_ok = Write::write_all(&mut uart, &tx_buf[..len]).await.is_ok();
+
+        let frame = if send_ok {
+            read_msp_response(&mut uart, &mut parser, Duration::from_millis(100)).await
+        } else {
+            None
+        };
+
+        if let Some(frame) = frame {
+            if frame.cmd == msp::MSP_STATUS {
+                // Dump first 16 bytes of payload for debugging
+                if !logged_raw_status {
+                    info!("MSP STATUS size={} raw: {:02x} {:02x} {:02x} {:02x}  {:02x} {:02x} {:02x} {:02x}  {:02x} {:02x} {:02x} {:02x}  {:02x} {:02x} {:02x} {:02x}",
+                        frame.size,
+                        frame.payload[0], frame.payload[1], frame.payload[2], frame.payload[3],
+                        frame.payload[4], frame.payload[5], frame.payload[6], frame.payload[7],
+                        frame.payload[8], frame.payload[9], frame.payload[10], frame.payload[11],
+                        frame.payload[12], frame.payload[13], frame.payload[14], frame.payload[15],
+                    );
+                    logged_raw_status = true;
+                }
+                if let Some(flags) = msp::extract_mode_flags(&frame.payload, frame.size) {
+                    let mode = msp::resolve_flight_mode(flags, &box_map);
+                    let mut state = STATE.lock().await;
+                    if state.flight_mode != mode || !state.fc_connected {
+                        info!("MSP: flags=0x{:08x} mode={}", flags, defmt::Debug2Format(&mode));
+                    }
+                    state.fc_connected = true;
+                    state.flight_mode = mode;
+                    state.debug_flags = flags;
+                    drop(state);
+                    error_count = 0;
+                } else {
+                    error_count = error_count.saturating_add(1);
+                }
+            } else {
+                error_count = error_count.saturating_add(1);
+            }
+        } else {
+            error_count = error_count.saturating_add(1);
+        }
+
+        if error_count >= 10 {
+            let mut state = STATE.lock().await;
+            state.fc_connected = false;
+            state.flight_mode = FlightMode::ArmingForbidden;
+            drop(state);
+            // Reset counter to avoid spamming state writes every tick
+            error_count = 10;
+        }
+
+        Timer::after(Duration::from_millis(100)).await;
+    }
+}
+
 /// Build a [`ColorScheme`] from the current [`ColorMode`].
 fn build_color_scheme(mode: ColorMode, use_hsi: bool) -> ColorScheme {
     match mode {
@@ -156,6 +354,103 @@ fn build_color_scheme(mode: ColorMode, use_hsi: bool) -> ColorScheme {
             RGB8 { r: 204, g: 0, b: 0 },
         ),
         ColorMode::Rainbow => ColorScheme::Rainbow { hue: 0, speed: 1, use_hsi },
+    }
+}
+
+/// Number of frames per armed show sub-pattern before advancing to the next.
+const ARMED_SHOW_FRAMES: u32 = 1000; // ~10 s at 100 FPS
+
+/// Number of armed show sub-patterns in the cycle.
+const ARMED_SHOW_COUNT: u32 = 4;
+
+/// Render the armed show pattern: cyclic rainbow variations.
+///
+/// `frame` is the global frame counter; the sub-pattern index is derived from it.
+fn render_armed_show(leds: &mut [RGB8], frame: u32) {
+    let sub = (frame / ARMED_SHOW_FRAMES) % ARMED_SHOW_COUNT;
+    let num = leds.len();
+    let tick = frame as u8; // wrapping is fine for hue rotation
+
+    match sub {
+        0 => {
+            // Static rainbow gradient, slowly rotating
+            for (i, led) in leds.iter_mut().enumerate() {
+                let hue = tick.wrapping_add((i * 256 / num.max(1)) as u8);
+                *led = smart_leds::hsv::hsv2rgb(smart_leds::hsv::Hsv {
+                    hue,
+                    sat: 255,
+                    val: 255,
+                });
+            }
+        }
+        1 => {
+            // Rainbow pulse: all LEDs same hue (rotating), pulsing brightness
+            // Triangle wave: 0→1→0 over 200 frames
+            let half = (frame % 200) as u16;
+            let t = if half < 100 { half } else { 200 - half } as f32 / 100.0;
+            let brightness = 0.4 + 0.6 * t;
+            let val = (brightness * 255.0) as u8;
+            for (i, led) in leds.iter_mut().enumerate() {
+                let hue = tick.wrapping_add((i * 256 / num.max(1)) as u8);
+                *led = smart_leds::hsv::hsv2rgb(smart_leds::hsv::Hsv {
+                    hue,
+                    sat: 255,
+                    val,
+                });
+            }
+        }
+        2 => {
+            // Rainbow chase: fast scroll
+            let offset = (frame * 3) as u8;
+            for (i, led) in leds.iter_mut().enumerate() {
+                let hue = offset.wrapping_add((i * 256 / num.max(1)) as u8);
+                *led = smart_leds::hsv::hsv2rgb(smart_leds::hsv::Hsv {
+                    hue,
+                    sat: 255,
+                    val: 255,
+                });
+            }
+        }
+        _ => {
+            // Rainbow with sparkle: normal rainbow + occasional bright white
+            let xor_state = frame.wrapping_mul(2654435761); // simple hash
+            for (i, led) in leds.iter_mut().enumerate() {
+                let hue =
+                    (tick.wrapping_mul(2)).wrapping_add((i * 256 / num.max(1)) as u8);
+                let sparkle = (xor_state ^ (i as u32 * 7919)).is_multiple_of(40);
+                if sparkle {
+                    *led = RGB8 { r: 255, g: 255, b: 255 };
+                } else {
+                    *led = smart_leds::hsv::hsv2rgb(smart_leds::hsv::Hsv {
+                        hue,
+                        sat: 255,
+                        val: 255,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Render the failsafe pattern: sliding red bars with black gaps.
+fn render_failsafe(leds: &mut [RGB8], frame: u32) {
+    let num = leds.len();
+    if num == 0 {
+        return;
+    }
+    // Bar and gap width: ~1/5 of strip length, minimum 2
+    let bar_width = (num / 5).max(2);
+    let period = bar_width * 2; // bar + gap
+    // Offset advances by 2 LEDs per frame
+    let offset = (frame as usize * 2) % period;
+
+    for (i, led) in leds.iter_mut().enumerate() {
+        let pos = (i + offset) % period;
+        if pos < bar_width {
+            *led = RGB8 { r: 255, g: 0, b: 0 };
+        } else {
+            *led = RGB8 { r: 0, g: 0, b: 0 };
+        }
     }
 }
 
@@ -175,6 +470,7 @@ async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
 
     let mut buf = [RGB8 { r: 0, g: 0, b: 0 }; MAX_LEDS];
     let mut write_err_logged = false;
+    let mut frame_counter: u32 = 0;
 
     loop {
         let state = STATE.lock().await;
@@ -182,6 +478,11 @@ async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
         let led_brightness = state.brightness;
         let max_ma = state.max_current_ma;
         let fps = state.fps.max(1);
+        let fc_connected = state.fc_connected;
+        let flight_mode = state.flight_mode;
+        let debug_flags = state.debug_flags;
+        let debug_arm_box = state.debug_arm_box;
+        let debug_failsafe_box = state.debug_failsafe_box;
         let color_mode = state.color_mode;
         let color_params = state.color_params;
         let use_hsi = state.use_hsi;
@@ -192,34 +493,76 @@ async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
         let anim_params = state.anim_params;
         drop(state);
 
-        // Rebuild color scheme when the mode or HSI toggle changes, preserving rainbow hue otherwise.
-        if color_mode != prev_color_mode || use_hsi != prev_use_hsi {
-            color_scheme = build_color_scheme(color_mode, use_hsi);
-            prev_color_mode = color_mode;
-            prev_use_hsi = use_hsi;
-        }
-        color_scheme.set_hue_speed(color_params.hue_speed);
-
-        // Apply live animation parameters.
-        match anim_params {
-            AnimModeParams::Pulse { speed, min_intensity_pct } => {
-                pulse.set_params(speed, min_intensity_pct as f32 / 100.0);
-            }
-            AnimModeParams::Ripple { speed_x10, width_x10, decay_pct } => {
-                ripple.set_params(
-                    speed_x10 as f32 / 10.0,
-                    width_x10 as f32 / 10.0,
-                    decay_pct as f32 / 100.0,
-                );
-            }
-            AnimModeParams::Static => {}
-        }
-
         let active = &mut buf[..num_leds];
-        match anim_mode {
-            AnimMode::Static => static_anim.render(active, &mut color_scheme),
-            AnimMode::Pulse => pulse.render(active, &mut color_scheme),
-            AnimMode::Ripple => ripple.render(active, &mut color_scheme),
+
+        // Flight-mode override logic:
+        // - Armed → rainbow show cycle
+        // - Failsafe → sliding red bars
+        // - Disarmed (FC connected) → solid green pulse
+        // - No FC → user-selected pattern from web UI
+        if fc_connected && flight_mode == FlightMode::Armed {
+            render_armed_show(active, frame_counter);
+        } else if fc_connected && flight_mode == FlightMode::Failsafe {
+            render_failsafe(active, frame_counter);
+        } else if fc_connected && flight_mode == FlightMode::ArmingAllowed {
+            // FC connected, disarmed: green pulse with debug overlay
+            let mut green_scheme = ColorScheme::Solid(RGB8 { r: 0, g: 204, b: 0 });
+            pulse.render(active, &mut green_scheme);
+
+            // Debug: first 33 LEDs on black background.
+            // LED 0: white = BOXNAMES ok, magenta = BOXNAMES missing
+            // LED 1–32: flag bits. Green = ARM box, Red = FAILSAFE box,
+            // Blue = other set bit. Bright = set, dim = not set.
+            let overlay_len = 33.min(active.len());
+            if overlay_len > 0 {
+                // LED 0: BOXNAMES status
+                active[0] = if debug_arm_box != 255 {
+                    RGB8 { r: 255, g: 255, b: 255 } // white = got BOXNAMES
+                } else {
+                    RGB8 { r: 255, g: 0, b: 255 } // magenta = no BOXNAMES
+                };
+            }
+            for (i, led) in active.iter_mut().enumerate().take(overlay_len).skip(1) {
+                let bit = i - 1;
+                let bit_set = debug_flags & (1 << bit) != 0;
+                *led = if bit as u8 == debug_arm_box {
+                    if bit_set { RGB8 { r: 0, g: 255, b: 0 } } else { RGB8 { r: 0, g: 40, b: 0 } }
+                } else if bit as u8 == debug_failsafe_box {
+                    if bit_set { RGB8 { r: 255, g: 0, b: 0 } } else { RGB8 { r: 40, g: 0, b: 0 } }
+                } else if bit_set {
+                    RGB8 { r: 0, g: 0, b: 128 }
+                } else {
+                    RGB8 { r: 0, g: 0, b: 0 }
+                }
+            }
+        } else {
+            // Normal user-selected pattern
+            if color_mode != prev_color_mode || use_hsi != prev_use_hsi {
+                color_scheme = build_color_scheme(color_mode, use_hsi);
+                prev_color_mode = color_mode;
+                prev_use_hsi = use_hsi;
+            }
+            color_scheme.set_hue_speed(color_params.hue_speed);
+
+            match anim_params {
+                AnimModeParams::Pulse { speed, min_intensity_pct } => {
+                    pulse.set_params(speed, min_intensity_pct as f32 / 100.0);
+                }
+                AnimModeParams::Ripple { speed_x10, width_x10, decay_pct } => {
+                    ripple.set_params(
+                        speed_x10 as f32 / 10.0,
+                        width_x10 as f32 / 10.0,
+                        decay_pct as f32 / 100.0,
+                    );
+                }
+                AnimModeParams::Static => {}
+            }
+
+            match anim_mode {
+                AnimMode::Static => static_anim.render(active, &mut color_scheme),
+                AnimMode::Pulse => pulse.render(active, &mut color_scheme),
+                AnimMode::Ripple => ripple.render(active, &mut color_scheme),
+            }
         }
 
         let pipeline = [
@@ -242,6 +585,7 @@ async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
             _ => {}
         }
 
+        frame_counter = frame_counter.wrapping_add(1);
         Timer::after(Duration::from_millis(1000 / fps as u64)).await;
     }
 }

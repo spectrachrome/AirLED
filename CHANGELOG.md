@@ -9,6 +9,13 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Added
 
+- MSP flight controller integration over UART1 (GPIO20 RX, GPIO21 TX, 115200 baud)
+- `msp` module (`src/msp.rs`): MSPv1 frame builder, response parser state machine, BOXNAMES decoder, flight mode resolver — all `no_std`, no heap, fully unit-testable
+- `msp_task`: async task polling MSP_STATUS at ~10 Hz, with BOXNAMES discovery at startup
+- `fc_connected` field in `LedState` for FC connection tracking
+- Armed flight mode override: cyclic rainbow show patterns (static rainbow, rainbow pulse, rainbow chase, rainbow sparkle), auto-advancing every ~10 s
+- Failsafe flight mode override: sliding red bars with black gaps
+- Disarmed / no FC connected: normal user-selected pattern from web UI (unchanged behavior)
 - Two independent axes: `ColorScheme` (solid green, solid red, split, rainbow) × `Animation` (static, pulse, ripple) for 12 combinations
 - `ColorScheme` enum in `src/pattern.rs` with `color_at()`, `tick()`, and `set_hue_speed()`
 - `Animation` trait replacing `Pattern` trait — `render(&mut self, leds, colors)`
