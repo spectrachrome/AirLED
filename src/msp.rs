@@ -307,10 +307,34 @@ pub fn extract_mode_flags(payload: &[u8], size: u8) -> Option<u32> {
     ]))
 }
 
+/// Extract the arming disable flags from an MSP_STATUS response payload.
+///
+/// In Betaflight 4.x (API 1.36+), bytes 17–20 contain a `u32 LE` bitmask
+/// of arming disable reasons. Zero means arming is allowed.
+/// Returns `None` if the payload is too short (pre-4.x firmware).
+pub fn extract_arming_disable_flags(payload: &[u8], size: u8) -> Option<u32> {
+    if size < 21 {
+        return None;
+    }
+    Some(u32::from_le_bytes([
+        payload[17],
+        payload[18],
+        payload[19],
+        payload[20],
+    ]))
+}
+
 /// Resolve a flight mode bitmask to a [`FlightMode`] using the box map.
 ///
-/// Priority: Failsafe > Armed > ArmingAllowed (FC connected but disarmed).
-pub fn resolve_flight_mode(flags: u32, box_map: &[BoxId; MAX_BOXES]) -> FlightMode {
+/// `arming_disable_flags` is `0` when arming is allowed, nonzero when
+/// something prevents arming (e.g. USB connected, throttle not low).
+///
+/// Priority: Failsafe > Armed > ArmingForbidden > ArmingAllowed.
+pub fn resolve_flight_mode(
+    flags: u32,
+    box_map: &[BoxId; MAX_BOXES],
+    arming_disable_flags: u32,
+) -> FlightMode {
     let mut armed = false;
     let mut failsafe = false;
 
@@ -330,6 +354,8 @@ pub fn resolve_flight_mode(flags: u32, box_map: &[BoxId; MAX_BOXES]) -> FlightMo
         FlightMode::Failsafe
     } else if armed {
         FlightMode::Armed
+    } else if arming_disable_flags != 0 {
+        FlightMode::ArmingForbidden
     } else {
         FlightMode::ArmingAllowed
     }
@@ -488,8 +514,7 @@ mod tests {
         let mut box_map = [BoxId::Unknown; MAX_BOXES];
         box_map[0] = BoxId::Arm;
         box_map[2] = BoxId::Failsafe;
-        // Only ARM bit set
-        let mode = resolve_flight_mode(0b001, &box_map);
+        let mode = resolve_flight_mode(0b001, &box_map, 0);
         assert_eq!(mode, FlightMode::Armed);
     }
 
@@ -498,17 +523,24 @@ mod tests {
         let mut box_map = [BoxId::Unknown; MAX_BOXES];
         box_map[0] = BoxId::Arm;
         box_map[2] = BoxId::Failsafe;
-        // Both ARM and FAILSAFE bits set
-        let mode = resolve_flight_mode(0b101, &box_map);
+        let mode = resolve_flight_mode(0b101, &box_map, 0);
         assert_eq!(mode, FlightMode::Failsafe);
     }
 
     #[test]
-    fn resolve_disarmed() {
+    fn resolve_arming_allowed() {
         let mut box_map = [BoxId::Unknown; MAX_BOXES];
         box_map[0] = BoxId::Arm;
-        // No bits set
-        let mode = resolve_flight_mode(0, &box_map);
+        let mode = resolve_flight_mode(0, &box_map, 0);
         assert_eq!(mode, FlightMode::ArmingAllowed);
+    }
+
+    #[test]
+    fn resolve_arming_forbidden() {
+        let mut box_map = [BoxId::Unknown; MAX_BOXES];
+        box_map[0] = BoxId::Arm;
+        // arming_disable_flags nonzero = arming forbidden
+        let mode = resolve_flight_mode(0, &box_map, 0x0004);
+        assert_eq!(mode, FlightMode::ArmingForbidden);
     }
 }

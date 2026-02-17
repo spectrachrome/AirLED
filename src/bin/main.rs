@@ -57,6 +57,9 @@ const AP_IP: Ipv4Address = Ipv4Address::new(192, 168, 4, 1);
 /// Maximum number of active LEDs (must match `MAX_LEDS`).
 const MAX_NUM_LEDS: u16 = MAX_LEDS as u16;
 
+/// Enable MSP debug LED overlay (flag bits on first 33 LEDs when disarmed).
+const MSP_DEBUG_LEDS: bool = false;
+
 #[esp_hal::main]
 fn main() -> ! {
     rtt_target::rtt_init_defmt!();
@@ -311,7 +314,9 @@ async fn msp_task(mut uart: Uart<'static, esp_hal::Async>) {
                     logged_raw_status = true;
                 }
                 if let Some(flags) = msp::extract_mode_flags(&frame.payload, frame.size) {
-                    let mode = msp::resolve_flight_mode(flags, &box_map);
+                    let arming_disable = msp::extract_arming_disable_flags(&frame.payload, frame.size)
+                        .unwrap_or(0);
+                    let mode = msp::resolve_flight_mode(flags, &box_map, arming_disable);
                     let mut state = STATE.lock().await;
                     if state.flight_mode != mode || !state.fc_connected {
                         info!("MSP: flags=0x{:08x} mode={}", flags, defmt::Debug2Format(&mode));
@@ -461,6 +466,8 @@ async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
     let mut ws = Ws2812::new(spi_bus, &mut ws_buf);
 
     let mut pulse = Pulse::new();
+    let mut slow_pulse = Pulse::new();
+    slow_pulse.set_params(400, 0.1);
     let mut ripple = RippleEffect::new(0xDEAD_BEEF);
     let mut static_anim = StaticAnim;
 
@@ -498,41 +505,44 @@ async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
         // Flight-mode override logic:
         // - Armed → rainbow show cycle
         // - Failsafe → sliding red bars
-        // - Disarmed (FC connected) → solid green pulse
+        // - Arming forbidden (FC connected) → slow red pulse
+        // - Arming allowed (FC connected) → solid green pulse
         // - No FC → user-selected pattern from web UI
         if fc_connected && flight_mode == FlightMode::Armed {
             render_armed_show(active, frame_counter);
         } else if fc_connected && flight_mode == FlightMode::Failsafe {
             render_failsafe(active, frame_counter);
+        } else if fc_connected && flight_mode == FlightMode::ArmingForbidden {
+            // FC connected, arming forbidden: slow red pulse
+            let mut red_scheme = ColorScheme::Solid(RGB8 { r: 204, g: 0, b: 0 });
+            slow_pulse.render(active, &mut red_scheme);
         } else if fc_connected && flight_mode == FlightMode::ArmingAllowed {
             // FC connected, disarmed: green pulse with debug overlay
             let mut green_scheme = ColorScheme::Solid(RGB8 { r: 0, g: 204, b: 0 });
             pulse.render(active, &mut green_scheme);
 
-            // Debug: first 33 LEDs on black background.
-            // LED 0: white = BOXNAMES ok, magenta = BOXNAMES missing
-            // LED 1–32: flag bits. Green = ARM box, Red = FAILSAFE box,
-            // Blue = other set bit. Bright = set, dim = not set.
-            let overlay_len = 33.min(active.len());
-            if overlay_len > 0 {
-                // LED 0: BOXNAMES status
-                active[0] = if debug_arm_box != 255 {
-                    RGB8 { r: 255, g: 255, b: 255 } // white = got BOXNAMES
-                } else {
-                    RGB8 { r: 255, g: 0, b: 255 } // magenta = no BOXNAMES
-                };
-            }
-            for (i, led) in active.iter_mut().enumerate().take(overlay_len).skip(1) {
-                let bit = i - 1;
-                let bit_set = debug_flags & (1 << bit) != 0;
-                *led = if bit as u8 == debug_arm_box {
-                    if bit_set { RGB8 { r: 0, g: 255, b: 0 } } else { RGB8 { r: 0, g: 40, b: 0 } }
-                } else if bit as u8 == debug_failsafe_box {
-                    if bit_set { RGB8 { r: 255, g: 0, b: 0 } } else { RGB8 { r: 40, g: 0, b: 0 } }
-                } else if bit_set {
-                    RGB8 { r: 0, g: 0, b: 128 }
-                } else {
-                    RGB8 { r: 0, g: 0, b: 0 }
+            // Debug: first 33 LEDs show flag bits (compile-time flag)
+            if MSP_DEBUG_LEDS {
+                let overlay_len = 33.min(active.len());
+                if overlay_len > 0 {
+                    active[0] = if debug_arm_box != 255 {
+                        RGB8 { r: 255, g: 255, b: 255 }
+                    } else {
+                        RGB8 { r: 255, g: 0, b: 255 }
+                    };
+                }
+                for (i, led) in active.iter_mut().enumerate().take(overlay_len).skip(1) {
+                    let bit = i - 1;
+                    let bit_set = debug_flags & (1 << bit) != 0;
+                    *led = if bit as u8 == debug_arm_box {
+                        if bit_set { RGB8 { r: 0, g: 255, b: 0 } } else { RGB8 { r: 0, g: 40, b: 0 } }
+                    } else if bit as u8 == debug_failsafe_box {
+                        if bit_set { RGB8 { r: 255, g: 0, b: 0 } } else { RGB8 { r: 40, g: 0, b: 0 } }
+                    } else if bit_set {
+                        RGB8 { r: 0, g: 0, b: 128 }
+                    } else {
+                        RGB8 { r: 0, g: 0, b: 0 }
+                    }
                 }
             }
         } else {
