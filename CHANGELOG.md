@@ -9,6 +9,12 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Added
 
+- BLE Nordic UART Service (NUS) for app control via JSON protocol
+- `ble` module (`src/ble.rs`): Command/Response types with serde, command handler, state snapshot builder, JSON serialization helpers — all `no_std`, no heap, unit-testable
+- `ble_task`: async task advertising as "AirLED", serving NUS GATT service with chunked notifications
+- Newline-delimited JSON protocol over BLE: externally-tagged command enums (`{"GetState":null}`, `{"SetBrightness":{"value":128}}`), flat `StateResponse` struct, plain `"ok\n"` / `"err:reason\n"` acks
+- Auto-push state on BLE connect and on MSP flight mode change via `STATE_CHANGED` signal
+- Chunked BLE notifications (20-byte MTU) for state responses (~250 bytes)
 - MSP flight controller integration over UART1 (GPIO20 RX, GPIO21 TX, 115200 baud)
 - `msp` module (`src/msp.rs`): MSPv1 frame builder, response parser state machine, BOXNAMES decoder, flight mode resolver — all `no_std`, no heap, fully unit-testable
 - `msp_task`: async task polling MSP_STATUS at ~10 Hz, with BOXNAMES discovery at startup
