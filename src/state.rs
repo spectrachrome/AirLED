@@ -5,6 +5,7 @@
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
+use embassy_sync::signal::Signal;
 
 /// Active color scheme.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, defmt::Format)]
@@ -134,6 +135,8 @@ pub struct LedState {
     pub debug_arm_box: u8,
     /// Index of the FAILSAFE box in the BOXNAMES map (255 = not found).
     pub debug_failsafe_box: u8,
+    /// AUX8 strobe active (RC channel 12 > 2000).
+    pub aux_strobe: bool,
 }
 
 impl Default for LedState {
@@ -156,9 +159,21 @@ impl Default for LedState {
             debug_flags: 0,
             debug_arm_box: 255,
             debug_failsafe_box: 255,
+            aux_strobe: false,
         }
     }
 }
+
+/// BLE flash request: number of flashes (1 = connect, 2 = disconnect).
+///
+/// The LED task picks this up and plays a blue flash sequence over 750 ms.
+pub static BLE_FLASH: Signal<CriticalSectionRawMutex, u8> = Signal::new();
+
+/// Signal to notify the BLE task that state has changed.
+///
+/// Any task that modifies state can signal this to trigger a BLE push notification.
+/// The signal carries no data — the BLE task reads the current state when woken.
+pub static STATE_CHANGED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// Global shared state protected by an async mutex.
 ///
@@ -184,4 +199,5 @@ pub static STATE: Mutex<CriticalSectionRawMutex, LedState> = Mutex::new(LedState
     debug_flags: 0,
     debug_arm_box: 255,
     debug_failsafe_box: 255,
+    aux_strobe: false,
 });

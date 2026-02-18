@@ -19,6 +19,14 @@ use esp_hal::spi::Mode;
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::uart::{Config as UartConfig, Uart};
+use bleps::ad_structure::{
+    create_advertising_data, AdStructure, BR_EDR_NOT_SUPPORTED, LE_GENERAL_DISCOVERABLE,
+};
+use bleps::async_attribute_server::AttributeServer;
+use bleps::asynch::Ble;
+use bleps::attribute_server::NotificationData;
+use bleps::gatt;
+use esp_radio::ble::controller::BleConnector;
 use esp_radio::wifi::{
     AccessPointConfig, ModeConfig, WifiApState, ap_state,
 };
@@ -32,8 +40,11 @@ use xiao_drone_led_controller::pattern::{
     Animation, ColorScheme, Pulse, RippleEffect, StaticAnim,
 };
 use xiao_drone_led_controller::postfx::{PostEffect, apply_pipeline};
+use xiao_drone_led_controller::ble::{
+    self as ble_proto, HandleResult,
+};
 use xiao_drone_led_controller::state::{
-    AnimMode, AnimModeParams, ColorMode, FlightMode, STATE,
+    AnimMode, AnimModeParams, BLE_FLASH, ColorMode, FlightMode, STATE, STATE_CHANGED,
 };
 use static_cell::StaticCell;
 
@@ -67,7 +78,7 @@ fn main() -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    esp_alloc::heap_allocator!(size: 72 * 1024);
+    esp_alloc::heap_allocator!(size: 96 * 1024);
 
     info!("Initializing...");
 
@@ -127,6 +138,16 @@ fn main() -> ! {
         0, // random seed — no true randomness needed for AP
     );
 
+    // --- BLE setup ---
+    info!("Setting up BLE...");
+    let ble_connector = BleConnector::new(
+        radio_controller,
+        peripherals.BT,
+        esp_radio::ble::Config::default(),
+    )
+    .expect("BLE init failed");
+    info!("BLE ready");
+
     // --- MSP UART setup ---
     info!("Setting up MSP UART...");
     let msp_uart = Uart::new(peripherals.UART0, UartConfig::default())
@@ -142,6 +163,7 @@ fn main() -> ! {
     executor.run(move |spawner| {
         spawner.must_spawn(led_task(spi_bus));
         spawner.must_spawn(msp_task(msp_uart));
+        spawner.must_spawn(ble_task(ble_connector));
         spawner.must_spawn(net_task(runner));
         spawner.must_spawn(web_server(stack));
         spawner.must_spawn(dhcp_server(stack));
@@ -162,6 +184,297 @@ async fn wifi_keepalive(wifi_controller: esp_radio::wifi::WifiController<'static
     let _controller = wifi_controller;
     loop {
         Timer::after(Duration::from_secs(10)).await;
+    }
+}
+
+/// BLE notification chunk size (BLE default MTU payload).
+const BLE_CHUNK_SIZE: usize = 20;
+
+
+/// Shared BLE RX reassembly buffer (written by write callback, read by notifier).
+struct BleRxBuf {
+    data: [u8; 256],
+    len: usize,
+}
+
+/// Shared BLE TX response buffer (written by write callback/notifier, sent by notifier).
+struct BleTxBuf {
+    data: [u8; 512],
+    len: usize,
+    offset: usize,
+}
+
+static BLE_RX: critical_section::Mutex<core::cell::RefCell<BleRxBuf>> =
+    critical_section::Mutex::new(core::cell::RefCell::new(BleRxBuf {
+        data: [0; 256],
+        len: 0,
+    }));
+
+static BLE_TX: critical_section::Mutex<core::cell::RefCell<BleTxBuf>> =
+    critical_section::Mutex::new(core::cell::RefCell::new(BleTxBuf {
+        data: [0; 512],
+        len: 0,
+        offset: 0,
+    }));
+
+/// Signal to wake the BLE notifier when there is data to send.
+static BLE_NOTIFY: embassy_sync::signal::Signal<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    (),
+> = embassy_sync::signal::Signal::new();
+
+/// Process a complete command message from the RX buffer.
+///
+/// Called from the sync write callback. Writes the response into BLE_TX
+/// and signals the notifier.
+fn ble_handle_message(msg: &[u8]) {
+    let Some(cmd) = ble_proto::parse_command(msg) else {
+        // Write error response
+        critical_section::with(|cs| {
+            let mut tx = BLE_TX.borrow_ref_mut(cs);
+            let err = b"err:parse\n";
+            tx.data[..err.len()].copy_from_slice(err);
+            tx.len = err.len();
+            tx.offset = 0;
+        });
+        BLE_NOTIFY.signal(());
+        return;
+    };
+
+    // Try to lock state synchronously (should almost always succeed)
+    if let Ok(mut state) = STATE.try_lock() {
+        let result = ble_proto::handle_command(&cmd, &mut state);
+        critical_section::with(|cs| {
+            let mut tx = BLE_TX.borrow_ref_mut(cs);
+            tx.offset = 0;
+            match result {
+                HandleResult::SendState => {
+                    let resp = ble_proto::build_state_response(&state);
+                    tx.len = ble_proto::serialize_state(&resp, &mut tx.data).unwrap_or(0);
+                }
+                HandleResult::Ack => {
+                    tx.data[..3].copy_from_slice(b"ok\n");
+                    tx.len = 3;
+                }
+                HandleResult::Error(e) => {
+                    let eb = e.as_bytes();
+                    let len = eb.len().min(tx.data.len());
+                    tx.data[..len].copy_from_slice(&eb[..len]);
+                    tx.len = len;
+                }
+            }
+        });
+        BLE_NOTIFY.signal(());
+    }
+}
+
+/// BLE Nordic UART Service task.
+///
+/// Advertises as "AirLED", accepts connections, and serves the NUS GATT service.
+/// Commands arrive as JSON on RX; responses go out as notifications on TX.
+#[embassy_executor::task]
+async fn ble_task(mut connector: BleConnector<'static>) {
+    info!("BLE task started");
+
+    let current_millis = || embassy_time::Instant::now().as_millis();
+    let mut ble = Ble::new(&mut connector, current_millis);
+
+    loop {
+        // Reset buffers between connections
+        critical_section::with(|cs| {
+            let mut rx = BLE_RX.borrow_ref_mut(cs);
+            rx.len = 0;
+            let mut tx = BLE_TX.borrow_ref_mut(cs);
+            tx.len = 0;
+            tx.offset = 0;
+        });
+
+        // Initialize BLE stack
+        if let Err(e) = ble.init().await {
+            defmt::warn!("BLE init error: {}", defmt::Debug2Format(&e));
+            Timer::after(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        // Log our BLE MAC address (once)
+        match ble.cmd_read_br_addr().await {
+            Ok(addr) => info!(
+                "BLE MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]
+            ),
+            Err(e) => defmt::warn!("BLE read addr error: {}", defmt::Debug2Format(&e)),
+        }
+
+        // Set advertising data
+        let adv_data = create_advertising_data(&[
+            AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
+            AdStructure::CompleteLocalName(WIFI_SSID),
+        ]);
+        match adv_data {
+            Ok(data) => {
+                if let Err(e) = ble.cmd_set_le_advertising_data(data).await {
+                    defmt::warn!("BLE adv data error: {}", defmt::Debug2Format(&e));
+                    continue;
+                }
+            }
+            Err(e) => {
+                defmt::warn!("BLE adv build error: {}", defmt::Debug2Format(&e));
+                continue;
+            }
+        }
+
+        if let Err(e) = ble.cmd_set_le_advertising_parameters().await {
+            defmt::warn!("BLE adv params error: {}", defmt::Debug2Format(&e));
+            continue;
+        }
+
+        if let Err(e) = ble.cmd_set_le_advertise_enable(true).await {
+            defmt::warn!("BLE adv enable error: {}", defmt::Debug2Format(&e));
+            continue;
+        }
+
+        info!("BLE advertising as \"{}\"", WIFI_SSID);
+
+        // Track whether we've seen a real client (first RX write = client connected)
+        static BLE_CONNECTED: critical_section::Mutex<core::cell::Cell<bool>> =
+            critical_section::Mutex::new(core::cell::Cell::new(false));
+        critical_section::with(|cs| BLE_CONNECTED.borrow(cs).set(false));
+
+        // Write callback for NUS RX characteristic (sync — runs inside do_work)
+        let mut rx_wf = |_offset: usize, data: &[u8]| {
+            // Flash blue on first write (= real client connection confirmed)
+            critical_section::with(|cs| {
+                if !BLE_CONNECTED.borrow(cs).get() {
+                    BLE_CONNECTED.borrow(cs).set(true);
+                    BLE_FLASH.signal(1);
+                    defmt::info!("BLE client connected");
+                }
+            });
+
+            critical_section::with(|cs| {
+                let mut rx = BLE_RX.borrow_ref_mut(cs);
+                let space = rx.data.len() - rx.len;
+                let n = data.len().min(space);
+                let start = rx.len;
+                rx.data[start..start + n].copy_from_slice(&data[..n]);
+                rx.len = start + n;
+            });
+
+            // Check for complete message (newline-delimited)
+            let msg_result = critical_section::with(|cs| {
+                let rx = BLE_RX.borrow_ref(cs);
+                rx.data[..rx.len].iter().position(|&b| b == b'\n')
+            });
+
+            if let Some(nl_pos) = msg_result {
+                // Extract message and shift remainder
+                let mut msg = [0u8; 256];
+                let msg_len = critical_section::with(|cs| {
+                    let mut rx = BLE_RX.borrow_ref_mut(cs);
+                    msg[..nl_pos].copy_from_slice(&rx.data[..nl_pos]);
+                    let total = rx.len;
+                    let remaining = total - nl_pos - 1;
+                    rx.data.copy_within(nl_pos + 1..total, 0);
+                    rx.len = remaining;
+                    nl_pos
+                });
+                ble_handle_message(&msg[..msg_len]);
+            }
+        };
+
+        // Read callback for NUS TX (unused — we use notifications)
+        let mut tx_rf = |_offset: usize, data: &mut [u8]| {
+            let msg = b"use notify";
+            let len = msg.len().min(data.len());
+            data[..len].copy_from_slice(&msg[..len]);
+            len
+        };
+
+        gatt!([service {
+            uuid: "6e400001-b5a3-f393-e0a9-e50e24dcca9e",
+            characteristics: [
+                characteristic {
+                    name: "nus_rx",
+                    uuid: "6e400002-b5a3-f393-e0a9-e50e24dcca9e",
+                    write: rx_wf,
+                },
+                characteristic {
+                    name: "nus_tx",
+                    uuid: "6e400003-b5a3-f393-e0a9-e50e24dcca9e",
+                    notify: true,
+                    read: tx_rf,
+                },
+            ],
+        },]);
+
+        let mut no_rng = bleps::no_rng::NoRng;
+        let mut srv = AttributeServer::new(&mut ble, &mut gatt_attributes, &mut no_rng);
+
+        info!("BLE waiting for connection...");
+
+        // Notifier: returns the next chunk to send as a notification.
+        //
+        // If there is unsent data in BLE_TX, returns the next chunk immediately.
+        // Otherwise waits for BLE_NOTIFY (command response) or STATE_CHANGED (MSP push).
+        let mut notifier = || async {
+            loop {
+                // Check for pending chunk data
+                let chunk = critical_section::with(|cs| {
+                    let mut tx = BLE_TX.borrow_ref_mut(cs);
+                    if tx.offset < tx.len {
+                        let end = (tx.offset + BLE_CHUNK_SIZE).min(tx.len);
+                        let mut buf = [0u8; BLE_CHUNK_SIZE];
+                        let chunk_len = end - tx.offset;
+                        buf[..chunk_len].copy_from_slice(&tx.data[tx.offset..end]);
+                        tx.offset = end;
+                        Some((buf, chunk_len))
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some((buf, len)) = chunk {
+                    return NotificationData::new(nus_tx_handle, &buf[..len]);
+                }
+
+                // No pending data — wait for new response or state change
+                let notify_fut = BLE_NOTIFY.wait();
+                let state_fut = STATE_CHANGED.wait();
+
+                futures::pin_mut!(notify_fut);
+                futures::pin_mut!(state_fut);
+
+                match futures::future::select(notify_fut, state_fut).await {
+                    futures::future::Either::Left(_) => {
+                        // Command response queued — loop back to send chunks
+                    }
+                    futures::future::Either::Right(_) => {
+                        // State changed — snapshot and queue
+                        let state = STATE.lock().await;
+                        let resp = ble_proto::build_state_response(&state);
+                        drop(state);
+                        critical_section::with(|cs| {
+                            let mut tx = BLE_TX.borrow_ref_mut(cs);
+                            tx.len = ble_proto::serialize_state(&resp, &mut tx.data)
+                                .unwrap_or(0);
+                            tx.offset = 0;
+                        });
+                        // Loop back to send chunks
+                    }
+                }
+            }
+        };
+
+        match srv.run(&mut notifier).await {
+            Ok(()) => {
+                info!("BLE client disconnected");
+                BLE_FLASH.signal(2);
+            }
+            Err(e) => {
+                defmt::warn!("BLE server error: {}", defmt::Debug2Format(&e));
+                BLE_FLASH.signal(2);
+            }
+        }
     }
 }
 
@@ -248,9 +561,13 @@ async fn msp_task(mut uart: Uart<'static, esp_hal::Async>) {
     }
     info!("MSP: entering poll loop");
 
-    // --- Phase 2: poll MSP_STATUS at ~10 Hz ---
+    // --- Phase 2: poll MSP_STATUS at ~10 Hz, MSP_RC at ~5 Hz ---
     let mut error_count: u8 = 0;
     let mut logged_raw_status = false;
+    let mut rc_channels = [0u16; msp::MAX_RC_CHANNELS];
+    let mut prev_aux = [0u16; 12]; // AUX1–AUX12 (channels 5–16)
+    let mut rc_tick: u8 = 0;
+    let mut logged_rc_once = false;
 
     loop {
         // Retry box map if we never got it (FC wasn't ready at startup)
@@ -321,10 +638,14 @@ async fn msp_task(mut uart: Uart<'static, esp_hal::Async>) {
                     if state.flight_mode != mode || !state.fc_connected {
                         info!("MSP: flags=0x{:08x} mode={}", flags, defmt::Debug2Format(&mode));
                     }
+                    let changed = state.flight_mode != mode || !state.fc_connected;
                     state.fc_connected = true;
                     state.flight_mode = mode;
                     state.debug_flags = flags;
                     drop(state);
+                    if changed {
+                        STATE_CHANGED.signal(());
+                    }
                     error_count = 0;
                 } else {
                     error_count = error_count.saturating_add(1);
@@ -343,6 +664,58 @@ async fn msp_task(mut uart: Uart<'static, esp_hal::Async>) {
             drop(state);
             // Reset counter to avoid spamming state writes every tick
             error_count = 10;
+        }
+
+        // Poll RC channels every 5th tick (~2 Hz) with short timeout
+        rc_tick = rc_tick.wrapping_add(1);
+        if rc_tick.is_multiple_of(5) {
+            let len = msp::build_request(msp::MSP_RC, &[], &mut tx_buf);
+            if Write::write_all(&mut uart, &tx_buf[..len]).await.is_ok() {
+                if let Some(frame) =
+                    read_msp_response(&mut uart, &mut parser, Duration::from_millis(50)).await
+                {
+                    if frame.cmd == msp::MSP_RC {
+                        let count =
+                            msp::parse_rc_channels(&frame.payload, frame.size, &mut rc_channels);
+
+                        // Dump all channels once so we can see which are active
+                        if !logged_rc_once && count >= 4 {
+                            logged_rc_once = true;
+                            info!(
+                                "MSP RC ({} ch): {} {} {} {}  {} {} {} {}  {} {} {} {}  {} {} {} {}",
+                                count,
+                                rc_channels[0], rc_channels[1], rc_channels[2], rc_channels[3],
+                                rc_channels[4], rc_channels[5], rc_channels[6], rc_channels[7],
+                                rc_channels[8], rc_channels[9], rc_channels[10], rc_channels[11],
+                                rc_channels[12], rc_channels[13], rc_channels[14], rc_channels[15],
+                            );
+                        }
+
+                        // AUX8 (channel 12, index 11) strobe trigger
+                        // Check BEFORE updating prev_aux so we compare old vs new
+                        if count >= 12 {
+                            let strobe = rc_channels[11] > 1800;
+                            let was_strobe = prev_aux[7] > 1800;
+                            if strobe != was_strobe {
+                                let mut state = STATE.lock().await;
+                                state.aux_strobe = strobe;
+                                info!("MSP AUX8 strobe: {}", strobe);
+                            }
+                        }
+
+                        // Log AUX channel changes with deadband (channels 5–16)
+                        let aux_count = count.saturating_sub(4).min(12);
+                        for i in 0..aux_count {
+                            let ch = rc_channels[i + 4];
+                            let diff = ch.abs_diff(prev_aux[i]);
+                            if diff > 50 {
+                                info!("MSP AUX{}: {} -> {}", i + 1, prev_aux[i], ch);
+                                prev_aux[i] = ch;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         Timer::after(Duration::from_millis(100)).await;
@@ -479,12 +852,30 @@ async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
     let mut write_err_logged = false;
     let mut frame_counter: u32 = 0;
 
+    // BLE flash state: remaining frames in the flash sequence, number of flashes
+    let mut flash_remaining: u32 = 0;
+    let mut flash_count: u8 = 0;
+    let mut flash_total_frames: u32 = 0;
+
     loop {
+        // Check for new BLE flash request
+        if let Some(count) = BLE_FLASH.try_take() {
+            flash_count = count;
+            // Will be computed after we know FPS below
+            flash_remaining = u32::MAX; // sentinel — set properly after FPS read
+        }
+
         let state = STATE.lock().await;
         let num_leds = state.num_leds.min(MAX_NUM_LEDS) as usize;
         let led_brightness = state.brightness;
         let max_ma = state.max_current_ma;
         let fps = state.fps.max(1);
+
+        // Initialize flash frame count now that we know FPS
+        if flash_remaining == u32::MAX {
+            flash_total_frames = (fps as u32 * 750) / 1000; // 750ms worth of frames
+            flash_remaining = flash_total_frames;
+        }
         let fc_connected = state.fc_connected;
         let flight_mode = state.flight_mode;
         let debug_flags = state.debug_flags;
@@ -498,9 +889,87 @@ async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
         let bal_b = state.color_bal_b;
         let anim_mode = state.anim_mode;
         let anim_params = state.anim_params;
+        let aux_strobe = state.aux_strobe;
         drop(state);
 
         let active = &mut buf[..num_leds];
+
+        // AUX8 strobe override: fast white strobe (~12.5 Hz)
+        if aux_strobe {
+            // Toggle every 3 frames at 100 FPS ≈ 16.7 Hz strobe
+            let on = (frame_counter / 3).is_multiple_of(2);
+            let color = if on {
+                RGB8 { r: 255, g: 255, b: 255 }
+            } else {
+                RGB8 { r: 0, g: 0, b: 0 }
+            };
+            for led in active.iter_mut() {
+                *led = color;
+            }
+
+            // Apply brightness + current limit but skip gamma/color balance
+            let pipeline = [
+                PostEffect::Brightness(led_brightness),
+                PostEffect::CurrentLimit { max_ma },
+            ];
+            apply_pipeline(active, &pipeline);
+
+            match ws.write(active.iter().copied()) {
+                Err(e) if !write_err_logged => {
+                    defmt::warn!("LED write error: {}", defmt::Debug2Format(&e));
+                    write_err_logged = true;
+                }
+                Ok(_) if write_err_logged => {
+                    info!("LED write recovered");
+                    write_err_logged = false;
+                }
+                _ => {}
+            }
+            frame_counter = frame_counter.wrapping_add(1);
+            Timer::after(Duration::from_millis(1000 / fps as u64)).await;
+            continue;
+        }
+
+        // BLE flash override: solid blue flashes (1× connect, 2× disconnect)
+        if flash_remaining > 0 {
+            let blue = RGB8 { r: 0, g: 0, b: 255 };
+            let black = RGB8 { r: 0, g: 0, b: 0 };
+
+            let on = if flash_count == 1 {
+                // Single flash: solid blue for the entire 750ms
+                true
+            } else {
+                // Two flashes: on/off/on split across the total frames
+                // Pattern: [on 40%] [off 20%] [on 40%]
+                let pos = flash_total_frames - flash_remaining;
+                let first_end = flash_total_frames * 2 / 5;
+                let gap_end = flash_total_frames * 3 / 5;
+                pos < first_end || pos >= gap_end
+            };
+
+            let color = if on { blue } else { black };
+            for led in active.iter_mut() {
+                *led = color;
+            }
+
+            flash_remaining -= 1;
+
+            // Skip normal rendering and post-processing — write directly
+            match ws.write(active.iter().copied()) {
+                Err(e) if !write_err_logged => {
+                    defmt::warn!("LED write error: {}", defmt::Debug2Format(&e));
+                    write_err_logged = true;
+                }
+                Ok(_) if write_err_logged => {
+                    info!("LED write recovered");
+                    write_err_logged = false;
+                }
+                _ => {}
+            }
+            frame_counter = frame_counter.wrapping_add(1);
+            Timer::after(Duration::from_millis(1000 / fps as u64)).await;
+            continue;
+        }
 
         // Flight-mode override logic:
         // - Armed → rainbow show cycle

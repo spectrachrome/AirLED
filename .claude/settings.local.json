@@ -10,7 +10,10 @@
       "Bash(git -C /Users/moritz/Documents/Projects/FPV/VX3.5_XIAO_LED_Controller/xiao_drone_led_controller log --oneline -3)",
       "WebFetch(domain:docs.rs)",
       "Bash(cargo tree:*)",
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Bash(cargo doc:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(curl:*)"
     ]
   }
 }

@@ -13,6 +13,9 @@ pub const MSP_STATUS: u8 = 101;
 /// MSP command: box names (semicolon-separated list of mode names).
 pub const MSP_BOXNAMES: u8 = 116;
 
+/// MSP command: RC channel values (16 × u16 LE, 1000–2000 µs).
+pub const MSP_RC: u8 = 105;
+
 /// MSP command: box IDs (permanent numeric IDs, one byte each).
 pub const MSP_BOXIDS: u8 = 119;
 
@@ -285,6 +288,26 @@ pub fn parse_boxids(payload: &[u8], size: u8) -> [BoxId; MAX_BOXES] {
         };
     }
     map
+}
+
+// ---------------------------------------------------------------------------
+// RC channel parser
+// ---------------------------------------------------------------------------
+
+/// Maximum number of RC channels in an MSP_RC response.
+pub const MAX_RC_CHANNELS: usize = 16;
+
+/// Parse an MSP_RC response payload into channel values.
+///
+/// Each channel is a u16 LE value (typically 1000–2000 µs).
+/// Returns the number of channels parsed (up to [`MAX_RC_CHANNELS`]).
+pub fn parse_rc_channels(payload: &[u8], size: u8, out: &mut [u16; MAX_RC_CHANNELS]) -> usize {
+    let byte_len = size as usize;
+    let count = (byte_len / 2).min(MAX_RC_CHANNELS);
+    for i in 0..count {
+        out[i] = u16::from_le_bytes([payload[i * 2], payload[i * 2 + 1]]);
+    }
+    count
 }
 
 // ---------------------------------------------------------------------------
