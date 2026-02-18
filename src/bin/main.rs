@@ -692,29 +692,25 @@ async fn msp_task(mut uart: Uart<'static, esp_hal::Async>) {
                             );
                         }
 
-                        // AUX7 (channel 11, index 10) 3-position strobe trigger
-                        // ~1100 = off, ~1400 = low, ~1900 = full
-                        if count >= 11 {
-                            let ch = rc_channels[10];
-                            let strobe_level: u8 = if ch > 1650 {
-                                255 // full
-                            } else if ch > 1250 {
-                                80  // low
+                        // AUX7 (channel 11, index 10) 3-position strobe
+                        // AUX8 (channel 12, index 11) spring switch override → full
+                        // Skip first 3 RC polls to avoid garbage triggering strobe at boot
+                        if count >= 12 && rc_tick > 3 {
+                            let aux7 = rc_channels[10];
+                            let aux8 = rc_channels[11];
+                            let strobe_level: u8 = if aux8 > 1800 {
+                                255 // AUX8 spring switch → full blast
+                            } else if aux7 > 1650 {
+                                255 // AUX7 position 3 → full
+                            } else if aux7 > 1250 {
+                                80  // AUX7 position 2 → low
                             } else {
                                 0   // off
                             };
-                            let prev_ch = prev_aux[6];
-                            let prev_level: u8 = if prev_ch > 1650 {
-                                255
-                            } else if prev_ch > 1250 {
-                                80
-                            } else {
-                                0
-                            };
-                            if strobe_level != prev_level {
-                                info!("MSP AUX7 strobe: {}", strobe_level);
-                            }
                             let mut state = STATE.lock().await;
+                            if state.aux_strobe != strobe_level {
+                                info!("MSP strobe: {}", strobe_level);
+                            }
                             state.aux_strobe = strobe_level;
                         }
 
