@@ -64,6 +64,7 @@ pub struct StateResponse {
     pub ripple_decay: u8,
     pub fc_connected: bool,
     pub flight_mode: &'static str,
+    pub tx_linked: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +162,7 @@ pub fn build_state_response(state: &LedState) -> StateResponse {
         ripple_decay,
         fc_connected: state.fc_connected,
         flight_mode: flight_mode_str(state.flight_mode),
+        tx_linked: state.tx_linked,
     }
 }
 

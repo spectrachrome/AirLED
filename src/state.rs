@@ -137,6 +137,8 @@ pub struct LedState {
     pub debug_failsafe_box: u8,
     /// AUX7 strobe intensity (0 = off, nonzero = peak brightness).
     pub aux_strobe: u8,
+    /// Whether the RC transmitter has an active link (RSSI > 0).
+    pub tx_linked: bool,
 }
 
 impl Default for LedState {
@@ -160,6 +162,7 @@ impl Default for LedState {
             debug_arm_box: 255,
             debug_failsafe_box: 255,
             aux_strobe: 0,
+            tx_linked: false,
         }
     }
 }
@@ -200,4 +203,5 @@ pub static STATE: Mutex<CriticalSectionRawMutex, LedState> = Mutex::new(LedState
     debug_arm_box: 255,
     debug_failsafe_box: 255,
     aux_strobe: 0,
+    tx_linked: false,
 });

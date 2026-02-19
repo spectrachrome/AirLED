@@ -9,6 +9,17 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Added
 
+- TX link detection via RC stick channels — if all 4 sticks (AETR) read exactly 1500 µs, no TX is bound; strobe only activates when TX is linked
+- `tx_linked` field exposed in BLE `StateResponse` for app display
+
+### Removed
+
+- Wi-Fi AP hotspot, HTTP web UI, and DHCP server (BLE is now the sole control interface)
+- `embassy-net`, `smoltcp`, `edge-dhcp`, and `embedded-io` dependencies
+- `wifi` and `coex` features from `esp-radio` (no longer needed without Wi-Fi)
+
+### Added
+
 - BLE Nordic UART Service (NUS) for app control via JSON protocol
 - `ble` module (`src/ble.rs`): Command/Response types with serde, command handler, state snapshot builder, JSON serialization helpers — all `no_std`, no heap, unit-testable
 - `ble_task`: async task advertising as "AirLED", serving NUS GATT service with chunked notifications

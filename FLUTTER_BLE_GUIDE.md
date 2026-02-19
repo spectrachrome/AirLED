@@ -4,7 +4,7 @@ This guide is for building a Flutter companion app that controls the AirLED ESP3
 
 ## Architecture Overview
 
-The device runs on an ESP32-C3 (XIAO form factor) and exposes a **Nordic UART Service (NUS)** over BLE. Communication is newline-delimited JSON over a serial-like BLE pipe. The device also runs a Wi-Fi AP with HTTP control as a fallback, but BLE is the primary interface for the app.
+The device runs on an ESP32-C3 (XIAO form factor) and exposes a **Nordic UART Service (NUS)** over BLE. Communication is newline-delimited JSON over a serial-like BLE pipe. BLE is the primary and only control interface for the app.
 
 ## BLE Connection
 
@@ -242,7 +242,8 @@ Full JSON state snapshot. Approximately 250 bytes serialized.
   "ripple_width": 190,
   "ripple_decay": 97,
   "fc_connected": false,
-  "flight_mode": "arming_forbidden"
+  "flight_mode": "arming_forbidden",
+  "tx_linked": false
 }
 ```
 
@@ -268,6 +269,7 @@ Full JSON state snapshot. Approximately 250 bytes serialized.
 | `ripple_decay` | int | 90–99 | Ripple decay % |
 | `fc_connected` | bool | | Flight controller connected |
 | `flight_mode` | string | see below | Current flight mode |
+| `tx_linked` | bool | | RC transmitter link active (RSSI > 0) |
 
 ### Flight modes
 

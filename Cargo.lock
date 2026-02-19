@@ -348,38 +348,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "edge-dhcp"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e0b32c831ced877a78378312fe0b6f7cdd5759f3ba272578f582ff9bba5291d"
-dependencies = [
- "defmt 1.0.1",
- "edge-nal",
- "edge-raw",
- "embassy-futures",
- "embassy-time",
- "heapless 0.9.2",
- "num_enum",
- "rand_core 0.9.5",
-]
-
-[[package]]
-name = "edge-nal"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c7d7163586cb9d457a34561a644aa957ce870226729bf6c9c8beeaead7e0d8"
-dependencies = [
- "embassy-time",
- "embedded-io-async 0.7.0",
-]
-
-[[package]]
-name = "edge-raw"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "466dfce9c2172a4e947b81b556f1f07a86029fbac679e323cfb66c738cc2faea"
-
-[[package]]
 name = "embassy-embedded-hal"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -446,29 +414,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "embassy-net"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71f0aa32082b7df00164f485322d6edab59122c9718b363b07ec23424c2c06a0"
-dependencies = [
- "document-features",
- "embassy-net-driver",
- "embassy-sync 0.7.2",
- "embassy-time",
- "embedded-io-async 0.7.0",
- "embedded-nal-async",
- "heapless 0.8.0",
- "managed",
- "smoltcp",
-]
-
-[[package]]
-name = "embassy-net-driver"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "524eb3c489760508f71360112bca70f6e53173e6fe48fc5f0efd0f5ab217751d"
-
-[[package]]
 name = "embassy-sync"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -505,7 +450,6 @@ checksum = "f4fa65b9284d974dad7a23bb72835c4ec85c0b540d86af7fc4098c88cff51d65"
 dependencies = [
  "cfg-if",
  "critical-section",
- "defmt 1.0.1",
  "document-features",
  "embassy-time-driver",
  "embassy-time-queue-utils",
@@ -604,25 +548,6 @@ checksum = "2564b9f813c544241430e147d8bc454815ef9ac998878d30cc3055449f7fd4c0"
 dependencies = [
  "defmt 1.0.1",
  "embedded-io 0.7.1",
-]
-
-[[package]]
-name = "embedded-nal"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c56a28be191a992f28f178ec338a0bf02f63d7803244add736d026a471e6ed77"
-dependencies = [
- "nb 1.1.0",
-]
-
-[[package]]
-name = "embedded-nal-async"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb5a1bd585135d302f8f6d7de329310938093da6271b37a6c94b8798795c0c6d"
-dependencies = [
- "embedded-io-async 0.7.0",
- "embedded-nal",
 ]
 
 [[package]]
@@ -814,7 +739,6 @@ dependencies = [
  "cfg-if",
  "defmt 1.0.1",
  "document-features",
- "embassy-net-driver",
  "embedded-io 0.6.1",
  "embedded-io 0.7.1",
  "embedded-io-async 0.6.1",
@@ -1318,27 +1242,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "num_enum"
-version = "0.7.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1207a7e20ad57b847bbddc6776b968420d38292bbfe2089accff5e19e82454c"
-dependencies = [
- "num_enum_derive",
- "rustversion",
-]
-
-[[package]]
-name = "num_enum_derive"
-version = "0.7.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff32365de1b6743cb203b710788263c44a03de03802daf96092f2da4fe6ba4d7"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.115",
 ]
 
 [[package]]
@@ -1997,12 +1900,9 @@ dependencies = [
  "bleps",
  "critical-section",
  "defmt 0.3.100",
- "edge-dhcp",
  "embassy-executor",
- "embassy-net",
  "embassy-sync 0.7.2",
  "embassy-time",
- "embedded-io 0.7.1",
  "embedded-io-async 0.7.0",
  "esp-alloc",
  "esp-bootloader-esp-idf",
@@ -2016,7 +1916,6 @@ dependencies = [
  "serde",
  "serde-json-core",
  "smart-leds",
- "smoltcp",
  "static_cell",
  "ws2812-spi",
 ]

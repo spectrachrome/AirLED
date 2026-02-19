@@ -566,4 +566,5 @@ mod tests {
         let mode = resolve_flight_mode(0, &box_map, 0x0004);
         assert_eq!(mode, FlightMode::ArmingForbidden);
     }
+
 }
