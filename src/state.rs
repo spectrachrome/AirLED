@@ -7,6 +7,8 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
 
+use crate::dither::DitherMode;
+
 /// Active color scheme.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, defmt::Format)]
 pub enum ColorMode {
@@ -139,6 +141,18 @@ pub struct LedState {
     pub aux_strobe: u8,
     /// Whether the RC transmitter has an active link (RSSI > 0).
     pub tx_linked: bool,
+    /// Temporal dithering method (Off, ErrorDiffusion, Ordered, Hybrid).
+    pub dither_mode: DitherMode,
+    /// Dither refresh rate in Hz (100–960). Only used when dither_mode != Off.
+    /// Animation updates still happen at `fps` rate; the strip is refreshed
+    /// at this rate with dithered sub-frames between animation updates.
+    pub dither_fps: u16,
+    /// Remaining frames for a BLE test pattern (0 = inactive).
+    pub test_pattern_frames: u32,
+    /// Color mode for the active test pattern.
+    pub test_color: ColorMode,
+    /// Animation mode for the active test pattern.
+    pub test_anim: AnimMode,
 }
 
 impl Default for LedState {
@@ -163,6 +177,11 @@ impl Default for LedState {
             debug_failsafe_box: 255,
             aux_strobe: 0,
             tx_linked: false,
+            dither_mode: DitherMode::Hybrid,
+            dither_fps: 300,
+            test_pattern_frames: 0,
+            test_color: ColorMode::Split,
+            test_anim: AnimMode::Static,
         }
     }
 }
@@ -204,4 +223,9 @@ pub static STATE: Mutex<CriticalSectionRawMutex, LedState> = Mutex::new(LedState
     debug_failsafe_box: 255,
     aux_strobe: 0,
     tx_linked: false,
+    dither_mode: DitherMode::Hybrid,
+    dither_fps: 300,
+    test_pattern_frames: 0,
+    test_color: ColorMode::Split,
+    test_anim: AnimMode::Static,
 });

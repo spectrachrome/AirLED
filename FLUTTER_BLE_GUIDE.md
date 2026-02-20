@@ -219,6 +219,32 @@ Per-frame amplitude decay percentage. Only applies in ripple mode.
 
 - `value`: `u8` (clamped 90–99), default **97**
 
+### DisplayTestPattern
+
+Temporarily force a color + animation combo for a given duration, overriding FC flight mode patterns.
+
+```json
+{"DisplayTestPattern":{"color":"rainbow","anim":"ripple","duration_ms":5000}}
+```
+
+- `color`: string — any valid color mode key (see SetColorMode)
+- `anim`: string — any valid animation mode key (see SetAnimMode)
+- `duration_ms`: `u16` (1–65535) — how long to display the test pattern in milliseconds
+
+Returns `ok\n` on success, or `err:unknown_color_mode\n` / `err:unknown_anim_mode\n` on invalid values.
+
+The test pattern overrides FC flight mode displays but not AUX strobe or BLE flash indicators. When the duration expires, the device reverts to normal behavior and pushes a state update.
+
+### CancelTestPattern
+
+Stop a running test pattern immediately and revert to normal behavior.
+
+```json
+{"CancelTestPattern":null}
+```
+
+Returns `ok\n`. Safe to send even when no test pattern is active.
+
 ## StateResponse (device → app)
 
 Full JSON state snapshot. Approximately 250 bytes serialized.
@@ -243,7 +269,8 @@ Full JSON state snapshot. Approximately 250 bytes serialized.
   "ripple_decay": 97,
   "fc_connected": false,
   "flight_mode": "arming_forbidden",
-  "tx_linked": false
+  "tx_linked": false,
+  "test_active": false
 }
 ```
 
@@ -270,6 +297,7 @@ Full JSON state snapshot. Approximately 250 bytes serialized.
 | `fc_connected` | bool | | Flight controller connected |
 | `flight_mode` | string | see below | Current flight mode |
 | `tx_linked` | bool | | RC transmitter link active (RSSI > 0) |
+| `test_active` | bool | | A BLE test pattern is currently playing |
 
 ### Flight modes
 

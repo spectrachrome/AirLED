@@ -30,6 +30,7 @@ use xiao_drone_led_controller::msp::{
 use xiao_drone_led_controller::pattern::{
     Animation, ColorScheme, Pulse, RippleEffect, StaticAnim,
 };
+use xiao_drone_led_controller::dither::{self, DitherMode, DitherState};
 use xiao_drone_led_controller::postfx::{PostEffect, apply_pipeline};
 use xiao_drone_led_controller::ble::{
     self as ble_proto, HandleResult,
@@ -497,14 +498,14 @@ async fn msp_task(mut uart: Uart<'static, esp_hal::Async>) {
     }
     info!("MSP: entering poll loop");
 
-    // --- Phase 2: poll MSP_STATUS + MSP_RC + MSP_ANALOG every tick (~20 Hz) ---
+    // --- Phase 2: poll MSP_STATUS + MSP_RC every tick (~20 Hz) ---
     let mut error_count: u8 = 0;
     let mut logged_raw_status = false;
     let mut rc_channels = [0u16; msp::MAX_RC_CHANNELS];
     let mut prev_aux = [0u16; 12]; // AUX1–AUX12 (channels 5–16)
     let mut rc_tick: u8 = 0;
     let mut logged_rc_once = false;
-    let mut tx_linked = false;
+    let mut flight_mode = FlightMode::ArmingForbidden;
 
     loop {
         // Retry box map if we never got it (FC wasn't ready at startup)
@@ -571,6 +572,7 @@ async fn msp_task(mut uart: Uart<'static, esp_hal::Async>) {
                     let arming_disable = msp::extract_arming_disable_flags(&frame.payload, frame.size)
                         .unwrap_or(0);
                     let mode = msp::resolve_flight_mode(flags, &box_map, arming_disable);
+                    flight_mode = mode;
                     let mut state = STATE.lock().await;
                     if state.flight_mode != mode || !state.fc_connected {
                         info!("MSP: flags=0x{:08x} mode={}", flags, defmt::Debug2Format(&mode));
@@ -579,8 +581,15 @@ async fn msp_task(mut uart: Uart<'static, esp_hal::Async>) {
                     state.fc_connected = true;
                     state.flight_mode = mode;
                     state.debug_flags = flags;
+                    // TX link: FC reports ArmingAllowed or better → valid RX link
+                    let linked = mode != FlightMode::ArmingForbidden;
+                    let link_changed = state.tx_linked != linked;
+                    state.tx_linked = linked;
+                    if !linked {
+                        state.aux_strobe = 0;
+                    }
                     drop(state);
-                    if changed {
+                    if changed || link_changed {
                         STATE_CHANGED.signal(());
                     }
                     error_count = 0;
@@ -595,12 +604,12 @@ async fn msp_task(mut uart: Uart<'static, esp_hal::Async>) {
         }
 
         if error_count >= 10 {
+            flight_mode = FlightMode::ArmingForbidden;
             let mut state = STATE.lock().await;
             state.fc_connected = false;
             state.flight_mode = FlightMode::ArmingForbidden;
             state.aux_strobe = 0;
             state.tx_linked = false;
-            tx_linked = false;
             drop(state);
             // Reset counter to avoid spamming state writes every tick
             error_count = 10;
@@ -631,31 +640,12 @@ async fn msp_task(mut uart: Uart<'static, esp_hal::Async>) {
                             );
                         }
 
-                        // TX link detection: when no TX is bound all 4 stick
-                        // channels (AETR) sit at exactly 1500 µs.
-                        if count >= 4 {
-                            let linked = !(rc_channels[0] == 1500
-                                && rc_channels[1] == 1500
-                                && rc_channels[2] == 1500
-                                && rc_channels[3] == 1500);
-                            if linked != tx_linked {
-                                info!("MSP: TX link {}", if linked { "up" } else { "down" });
-                                tx_linked = linked;
-                                let mut state = STATE.lock().await;
-                                state.tx_linked = linked;
-                                if !linked {
-                                    state.aux_strobe = 0;
-                                }
-                                drop(state);
-                                STATE_CHANGED.signal(());
-                            }
-                        }
-
                         // AUX7 (channel 11, index 10) 3-position strobe
                         // AUX8 (channel 12, index 11) spring switch override → full
-                        // Suppress strobe for first 10s after boot and when TX is not linked
+                        // Suppress strobe for first 10s after boot and when FC
+                        // reports ArmingForbidden (no valid RX link).
                         let uptime_ms = embassy_time::Instant::now().as_millis();
-                        if count >= 12 && uptime_ms > 10_000 && tx_linked {
+                        if count >= 12 && uptime_ms > 10_000 && flight_mode != FlightMode::ArmingForbidden {
                             let aux7 = rc_channels[10];
                             let aux8 = rc_channels[11];
                             let strobe_level: u8 = if aux8 > 1800 {
@@ -746,7 +736,18 @@ async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
     let mut prev_color_mode = ColorMode::Split;
     let mut prev_use_hsi = false;
 
+    // Dedicated test-pattern animation instances (separate from user ones to preserve phase)
+    let mut test_pulse = Pulse::new();
+    let mut test_ripple = RippleEffect::new(0xBEEF_CAFE);
+    let mut test_static = StaticAnim;
+    let mut test_scheme = build_color_scheme(ColorMode::Split, false);
+    let mut test_prev_color = ColorMode::Split;
+
     let mut buf = [RGB8 { r: 0, g: 0, b: 0 }; MAX_LEDS];
+    let mut dither_state = DitherState::new();
+    let mut fix16_targets = [[0u16; 3]; MAX_LEDS];
+    let mut dither_output = [RGB8 { r: 0, g: 0, b: 0 }; MAX_LEDS];
+    let mut prev_dither_mode = DitherMode::Off;
     let mut write_err_logged = false;
     let mut frame_counter: u32 = 0;
 
@@ -788,7 +789,18 @@ async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
         let anim_mode = state.anim_mode;
         let anim_params = state.anim_params;
         let aux_strobe = state.aux_strobe;
+        let dither_mode = state.dither_mode;
+        let dither_fps = state.dither_fps;
+        let test_frames = state.test_pattern_frames;
+        let test_color = state.test_color;
+        let test_anim = state.test_anim;
         drop(state);
+
+        // Reset dither accumulators on mode change
+        if dither_mode != prev_dither_mode {
+            dither_state.reset();
+            prev_dither_mode = dither_mode;
+        }
 
         // Clear LEDs beyond active count so they don't hold stale colors
         for led in buf[num_leds..].iter_mut() {
@@ -797,7 +809,9 @@ async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
         let active = &mut buf[..num_leds];
 
         // AUX7 strobe override: fast white strobe (~25 Hz) with short attack/decay
+        // Strobe bypasses dithering entirely — direct u8 writes.
         if aux_strobe > 0 {
+            dither_state.reset();
             // 4-frame cycle: 2 on, 2 off → 25 Hz at 100 FPS
             const STROBE_HALF: u32 = 2;
             const STROBE_PERIOD: u32 = STROBE_HALF * 2;
@@ -832,6 +846,7 @@ async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
 
         // BLE flash override: solid blue flashes (1× connect, 2× disconnect)
         if flash_remaining > 0 {
+            dither_state.reset();
             let blue = RGB8 { r: 0, g: 0, b: 255 };
             let black = RGB8 { r: 0, g: 0, b: 0 };
 
@@ -855,6 +870,57 @@ async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
             flash_remaining -= 1;
 
             // Skip normal rendering and post-processing — write directly
+            match ws.write(buf.iter().copied()) {
+                Err(e) if !write_err_logged => {
+                    defmt::warn!("LED write error: {}", defmt::Debug2Format(&e));
+                    write_err_logged = true;
+                }
+                Ok(_) if write_err_logged => {
+                    info!("LED write recovered");
+                    write_err_logged = false;
+                }
+                _ => {}
+            }
+            frame_counter = frame_counter.wrapping_add(1);
+            Timer::after(Duration::from_millis(1000 / fps as u64)).await;
+            continue;
+        }
+
+        // BLE test pattern override (between BLE flash and FC flight mode)
+        if test_frames > 0 {
+            // Rebuild test color scheme if color changed
+            if test_color != test_prev_color {
+                test_scheme = build_color_scheme(test_color, use_hsi);
+                test_prev_color = test_color;
+            }
+
+            // Render with test animation
+            match test_anim {
+                AnimMode::Static => test_static.render(active, &mut test_scheme),
+                AnimMode::Pulse => test_pulse.render(active, &mut test_scheme),
+                AnimMode::Ripple => test_ripple.render(active, &mut test_scheme),
+            }
+
+            // Decrement remaining frames
+            {
+                let mut state = STATE.lock().await;
+                if state.test_pattern_frames > 0 {
+                    state.test_pattern_frames -= 1;
+                    if state.test_pattern_frames == 0 {
+                        drop(state);
+                        STATE_CHANGED.signal(());
+                    }
+                }
+            }
+
+            let pipeline = [
+                PostEffect::Gamma,
+                PostEffect::ColorBalance { r: bal_r, g: bal_g, b: bal_b },
+                PostEffect::Brightness(led_brightness),
+                PostEffect::CurrentLimit { max_ma },
+            ];
+            apply_pipeline(active, &pipeline);
+
             match ws.write(buf.iter().copied()) {
                 Err(e) if !write_err_logged => {
                     defmt::warn!("LED write error: {}", defmt::Debug2Format(&e));
@@ -943,28 +1009,76 @@ async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
             }
         }
 
-        let pipeline = [
-            PostEffect::Gamma,
-            PostEffect::ColorBalance { r: bal_r, g: bal_g, b: bal_b },
-            PostEffect::Brightness(led_brightness),
-            PostEffect::CurrentLimit { max_ma },
-        ];
-        apply_pipeline(active, &pipeline);
+        if dither_mode == DitherMode::Off {
+            // Non-dithered path: Gamma → Balance → Brightness → CurrentLimit → SPI write
+            let pipeline = [
+                PostEffect::Gamma,
+                PostEffect::ColorBalance { r: bal_r, g: bal_g, b: bal_b },
+                PostEffect::Brightness(led_brightness),
+                PostEffect::CurrentLimit { max_ma },
+            ];
+            apply_pipeline(active, &pipeline);
 
-        match ws.write(buf.iter().copied()) {
-            Err(e) if !write_err_logged => {
-                defmt::warn!("LED write error: {}", defmt::Debug2Format(&e));
-                write_err_logged = true;
+            match ws.write(buf.iter().copied()) {
+                Err(e) if !write_err_logged => {
+                    defmt::warn!("LED write error: {}", defmt::Debug2Format(&e));
+                    write_err_logged = true;
+                }
+                Ok(_) if write_err_logged => {
+                    info!("LED write recovered");
+                    write_err_logged = false;
+                }
+                _ => {}
             }
-            Ok(_) if write_err_logged => {
-                info!("LED write recovered");
-                write_err_logged = false;
+
+            frame_counter = frame_counter.wrapping_add(1);
+            Timer::after(Duration::from_millis(1000 / fps as u64)).await;
+        } else {
+            // Dithered path: Balance → Brightness → CurrentLimit → Gamma(fix16) → Dither loop
+            let pre_gamma_pipeline = [
+                PostEffect::ColorBalance { r: bal_r, g: bal_g, b: bal_b },
+                PostEffect::Brightness(led_brightness),
+                PostEffect::CurrentLimit { max_ma },
+            ];
+            apply_pipeline(active, &pre_gamma_pipeline);
+
+            // Convert to 8.8 fixed-point gamma targets (once per animation frame)
+            dither::gamma_to_fix16(active, &mut fix16_targets[..num_leds]);
+
+            // Inner dither loop: refresh strip at dither_fps rate
+            let sub_frames = (dither_fps as u32 / fps as u32).max(1);
+            let sub_frame_ms = 1000u64 / dither_fps as u64;
+
+            for _ in 0..sub_frames {
+                dither_state.dither_frame(
+                    dither_mode,
+                    &fix16_targets[..num_leds],
+                    &mut dither_output[..num_leds],
+                );
+
+                // Copy dithered output into main buffer for SPI write
+                buf[..num_leds].copy_from_slice(&dither_output[..num_leds]);
+                // Clear LEDs beyond active count
+                for led in buf[num_leds..].iter_mut() {
+                    *led = RGB8 { r: 0, g: 0, b: 0 };
+                }
+
+                match ws.write(buf.iter().copied()) {
+                    Err(e) if !write_err_logged => {
+                        defmt::warn!("LED write error: {}", defmt::Debug2Format(&e));
+                        write_err_logged = true;
+                    }
+                    Ok(_) if write_err_logged => {
+                        info!("LED write recovered");
+                        write_err_logged = false;
+                    }
+                    _ => {}
+                }
+
+                frame_counter = frame_counter.wrapping_add(1);
+                Timer::after(Duration::from_millis(sub_frame_ms)).await;
             }
-            _ => {}
         }
-
-        frame_counter = frame_counter.wrapping_add(1);
-        Timer::after(Duration::from_millis(1000 / fps as u64)).await;
     }
 }
 

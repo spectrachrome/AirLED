@@ -9,7 +9,18 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Added
 
-- TX link detection via RC stick channels — if all 4 sticks (AETR) read exactly 1500 µs, no TX is bound; strobe only activates when TX is linked
+- Temporal dithering module (`src/dither.rs`): adds extra perceived bit depth to WS2812B LEDs by varying quantized output frame-to-frame faster than flicker fusion
+- `DitherMode` enum with four modes: `Off`, `ErrorDiffusion` (smooth gradients), `Ordered` (Bayer 4x4, deterministic), `Hybrid` (error diffusion + correlated ordered for low brightness)
+- 8.8 fixed-point gamma LUTs (3 x 256 entries, 1536 bytes flash) computed at compile time for high-precision gamma correction in the dithered path
+- `SetDitherMode` and `SetDitherFps` BLE commands for runtime control of dithering
+- `dither_mode` and `dither_fps` fields in BLE `StateResponse`
+- Inner dither loop in LED task: animation renders at `fps` rate, strip refreshes at `dither_fps` rate (100–960 Hz) with different dither patterns between animation frames
+- Dither state auto-reset on mode change, strobe activation, and BLE flash sequences
+- Unit tests for dither algorithms (error diffusion convergence, ordered determinism, Fix16 gamma roundtrip)
+- `DisplayTestPattern` BLE command: temporarily force a color + animation combo for a given duration, overriding FC flight mode patterns
+- `CancelTestPattern` BLE command: stop a running test pattern immediately
+- `test_active` field in BLE `StateResponse` (true when a test pattern is playing)
+- RSSI-based TX link detection via MSP_ANALOG — strobe only activates when RSSI > 0 (replaces unreliable stick-center heuristic)
 - `tx_linked` field exposed in BLE `StateResponse` for app display
 
 ### Removed

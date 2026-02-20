@@ -7,6 +7,7 @@
 use heapless::String as HString;
 use serde::{Deserialize, Serialize};
 
+use crate::dither::DitherMode;
 use crate::state::{AnimMode, AnimModeParams, ColorMode, FlightMode, LedState};
 
 /// Maximum number of active LEDs (mirrors `MAX_LEDS` in main).
@@ -37,6 +38,14 @@ pub enum Command {
     SetRippleSpeed { value: u8 },
     SetRippleWidth { value: u8 },
     SetRippleDecay { value: u8 },
+    SetDitherMode { mode: HString<16> },
+    SetDitherFps { value: u16 },
+    DisplayTestPattern {
+        color: HString<16>,
+        anim: HString<16>,
+        duration_ms: u16,
+    },
+    CancelTestPattern,
 }
 
 // ---------------------------------------------------------------------------
@@ -65,6 +74,9 @@ pub struct StateResponse {
     pub fc_connected: bool,
     pub flight_mode: &'static str,
     pub tx_linked: bool,
+    pub dither_mode: &'static str,
+    pub dither_fps: u16,
+    pub test_active: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +109,27 @@ fn flight_mode_str(mode: FlightMode) -> &'static str {
         FlightMode::ArmingAllowed => "arming_allowed",
         FlightMode::Armed => "armed",
         FlightMode::Failsafe => "failsafe",
+    }
+}
+
+/// Map a [`DitherMode`] to its wire-format string key.
+pub fn dither_mode_str(mode: DitherMode) -> &'static str {
+    match mode {
+        DitherMode::Off => "off",
+        DitherMode::ErrorDiffusion => "error",
+        DitherMode::Ordered => "ordered",
+        DitherMode::Hybrid => "hybrid",
+    }
+}
+
+/// Parse a dither mode string into a [`DitherMode`].
+fn parse_dither_mode(s: &str) -> Option<DitherMode> {
+    match s {
+        "off" => Some(DitherMode::Off),
+        "error" => Some(DitherMode::ErrorDiffusion),
+        "ordered" => Some(DitherMode::Ordered),
+        "hybrid" => Some(DitherMode::Hybrid),
+        _ => None,
     }
 }
 
@@ -163,6 +196,9 @@ pub fn build_state_response(state: &LedState) -> StateResponse {
         fc_connected: state.fc_connected,
         flight_mode: flight_mode_str(state.flight_mode),
         tx_linked: state.tx_linked,
+        dither_mode: dither_mode_str(state.dither_mode),
+        dither_fps: state.dither_fps,
+        test_active: state.test_pattern_frames > 0,
     }
 }
 
@@ -262,6 +298,38 @@ pub fn handle_command(cmd: &Command, state: &mut LedState) -> HandleResult {
             if let AnimModeParams::Ripple { decay_pct, .. } = &mut state.anim_params {
                 *decay_pct = (*value).clamp(90, 99);
             }
+            HandleResult::Ack
+        }
+        Command::SetDitherMode { mode } => match parse_dither_mode(mode.as_str()) {
+            Some(m) => {
+                state.dither_mode = m;
+                HandleResult::Ack
+            }
+            None => HandleResult::Error("err:unknown_dither_mode\n"),
+        },
+        Command::SetDitherFps { value } => {
+            state.dither_fps = (*value).clamp(100, 960);
+            HandleResult::Ack
+        }
+        Command::DisplayTestPattern {
+            color,
+            anim,
+            duration_ms,
+        } => {
+            let Some(c) = parse_color_mode(color.as_str()) else {
+                return HandleResult::Error("err:unknown_color_mode\n");
+            };
+            let Some(a) = parse_anim_mode(anim.as_str()) else {
+                return HandleResult::Error("err:unknown_anim_mode\n");
+            };
+            let frames = (state.fps as u32 * *duration_ms as u32) / 1000;
+            state.test_color = c;
+            state.test_anim = a;
+            state.test_pattern_frames = frames.max(1);
+            HandleResult::Ack
+        }
+        Command::CancelTestPattern => {
+            state.test_pattern_frames = 0;
             HandleResult::Ack
         }
     }
