@@ -137,8 +137,10 @@ pub struct LedState {
     pub debug_arm_box: u8,
     /// Index of the FAILSAFE box in the BOXNAMES map (255 = not found).
     pub debug_failsafe_box: u8,
-    /// AUX7 strobe intensity (0 = off, nonzero = peak brightness).
+    /// AUX strobe intensity (0 = off, nonzero = peak brightness).
     pub aux_strobe: u8,
+    /// When true, strobe uses position-light colours (red port / green starboard).
+    pub strobe_split: bool,
     /// Whether the RC transmitter has an active link (RSSI > 0).
     pub tx_linked: bool,
     /// Temporal dithering method (Off, ErrorDiffusion, Ordered, Hybrid).
@@ -176,6 +178,7 @@ impl Default for LedState {
             debug_arm_box: 255,
             debug_failsafe_box: 255,
             aux_strobe: 0,
+            strobe_split: false,
             tx_linked: false,
             dither_mode: DitherMode::Off,
             dither_fps: 300,
@@ -222,6 +225,7 @@ pub static STATE: Mutex<CriticalSectionRawMutex, LedState> = Mutex::new(LedState
     debug_arm_box: 255,
     debug_failsafe_box: 255,
     aux_strobe: 0,
+    strobe_split: false,
     tx_linked: false,
     dither_mode: DitherMode::Off,
     dither_fps: 300,

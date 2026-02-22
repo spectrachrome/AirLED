@@ -7,6 +7,11 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ## [Unreleased]
 
+### Changed
+
+- Remap AUX strobe switches: AUX8 momentary → white strobe at 80, AUX7 mid → white strobe at 80, AUX7 high → position-light strobe (red port / green starboard) at 80
+- Add `strobe_split` field to `LedState` for position-light strobe mode
+
 ### Added
 
 - Temporal dithering module (`src/dither.rs`): adds extra perceived bit depth to WS2812B LEDs by varying quantized output frame-to-frame faster than flicker fusion

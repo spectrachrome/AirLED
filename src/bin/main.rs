@@ -160,19 +160,36 @@ static BLE_NOTIFY: embassy_sync::signal::Signal<
     (),
 > = embassy_sync::signal::Signal::new();
 
+/// Compact BLE_TX: shift unsent data to the start of the buffer.
+fn compact_tx(tx: &mut BleTxBuf) {
+    if tx.offset > 0 {
+        if tx.offset < tx.len {
+            tx.data.copy_within(tx.offset..tx.len, 0);
+            tx.len -= tx.offset;
+        } else {
+            tx.len = 0;
+        }
+        tx.offset = 0;
+    }
+}
+
 /// Process a complete command message from the RX buffer.
 ///
-/// Called from the sync write callback. Writes the response into BLE_TX
-/// and signals the notifier.
+/// Called from the sync write callback. Appends the response into BLE_TX
+/// (after any unsent data) and signals the notifier.
 fn ble_handle_message(msg: &[u8]) {
     let Some(cmd) = ble_proto::parse_command(msg) else {
-        // Write error response
+        // Append error response after any unsent data
         critical_section::with(|cs| {
             let mut tx = BLE_TX.borrow_ref_mut(cs);
+            compact_tx(&mut tx);
             let err = b"err:parse\n";
-            tx.data[..err.len()].copy_from_slice(err);
-            tx.len = err.len();
-            tx.offset = 0;
+            let start = tx.len;
+            let avail = tx.data.len() - start;
+            if err.len() <= avail {
+                tx.data[start..start + err.len()].copy_from_slice(err);
+                tx.len = start + err.len();
+            }
         });
         BLE_NOTIFY.signal(());
         return;
@@ -183,21 +200,33 @@ fn ble_handle_message(msg: &[u8]) {
         let result = ble_proto::handle_command(&cmd, &mut state);
         critical_section::with(|cs| {
             let mut tx = BLE_TX.borrow_ref_mut(cs);
-            tx.offset = 0;
+            compact_tx(&mut tx);
             match result {
                 HandleResult::SendState => {
                     let resp = ble_proto::build_state_response(&state);
-                    tx.len = ble_proto::serialize_state(&resp, &mut tx.data).unwrap_or(0);
+                    let start = tx.len;
+                    let written = ble_proto::serialize_state(
+                        &resp,
+                        &mut tx.data[start..],
+                    )
+                    .unwrap_or(0);
+                    tx.len = start + written;
                 }
                 HandleResult::Ack => {
-                    tx.data[..3].copy_from_slice(b"ok\n");
-                    tx.len = 3;
+                    let ack = b"ok\n";
+                    let start = tx.len;
+                    let avail = tx.data.len() - start;
+                    if ack.len() <= avail {
+                        tx.data[start..start + ack.len()].copy_from_slice(ack);
+                        tx.len = start + ack.len();
+                    }
                 }
                 HandleResult::Error(e) => {
                     let eb = e.as_bytes();
-                    let len = eb.len().min(tx.data.len());
-                    tx.data[..len].copy_from_slice(&eb[..len]);
-                    tx.len = len;
+                    let start = tx.len;
+                    let len = eb.len().min(tx.data.len() - start);
+                    tx.data[start..start + len].copy_from_slice(&eb[..len]);
+                    tx.len = start + len;
                 }
             }
         });
@@ -392,9 +421,14 @@ async fn ble_task(mut connector: BleConnector<'static>) {
                         drop(state);
                         critical_section::with(|cs| {
                             let mut tx = BLE_TX.borrow_ref_mut(cs);
-                            tx.len = ble_proto::serialize_state(&resp, &mut tx.data)
-                                .unwrap_or(0);
-                            tx.offset = 0;
+                            compact_tx(&mut tx);
+                            let start = tx.len;
+                            let written = ble_proto::serialize_state(
+                                &resp,
+                                &mut tx.data[start..],
+                            )
+                            .unwrap_or(0);
+                            tx.len = start + written;
                         });
                         // Loop back to send chunks
                     }
@@ -641,27 +675,31 @@ async fn msp_task(mut uart: Uart<'static, esp_hal::Async>) {
                         }
 
                         // AUX7 (channel 11, index 10) 3-position strobe
-                        // AUX8 (channel 12, index 11) spring switch override → full
+                        //   pos 1 (low)  → off
+                        //   pos 2 (mid)  → white strobe at 80
+                        //   pos 3 (high) → position-light strobe (red/green) at 80
+                        // AUX8 (channel 12, index 11) momentary → white strobe at 80
                         // Suppress strobe for first 10s after boot and when FC
                         // reports ArmingForbidden (no valid RX link).
                         let uptime_ms = embassy_time::Instant::now().as_millis();
                         if count >= 12 && uptime_ms > 10_000 && flight_mode != FlightMode::ArmingForbidden {
                             let aux7 = rc_channels[10];
                             let aux8 = rc_channels[11];
-                            let strobe_level: u8 = if aux8 > 1800 {
-                                255 // AUX8 spring switch → full blast
+                            let (strobe_level, strobe_split): (u8, bool) = if aux8 > 1800 {
+                                (80, false) // AUX8 momentary → mid white
                             } else if aux7 > 1650 {
-                                255 // AUX7 position 3 → full
+                                (80, true)  // AUX7 pos 3 → position-light (red/green)
                             } else if aux7 > 1250 {
-                                80  // AUX7 position 2 → low
+                                (80, false) // AUX7 pos 2 → mid white
                             } else {
-                                0   // off
+                                (0, false)  // off
                             };
                             let mut state = STATE.lock().await;
-                            if state.aux_strobe != strobe_level {
-                                info!("MSP strobe: {}", strobe_level);
+                            if state.aux_strobe != strobe_level || state.strobe_split != strobe_split {
+                                info!("MSP strobe: {} split={}", strobe_level, strobe_split);
                             }
                             state.aux_strobe = strobe_level;
+                            state.strobe_split = strobe_split;
                         }
 
                         // Log AUX channel changes with deadband (channels 5–16)
@@ -789,6 +827,7 @@ async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
         let anim_mode = state.anim_mode;
         let anim_params = state.anim_params;
         let aux_strobe = state.aux_strobe;
+        let strobe_split = state.strobe_split;
         let dither_mode = state.dither_mode;
         let dither_fps = state.dither_fps;
         let test_frames = state.test_pattern_frames;
@@ -823,9 +862,22 @@ async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
                 let off_phase = phase - STROBE_HALF;
                 ((STROBE_HALF - off_phase) as u16 * peak as u16 / STROBE_HALF as u16) as u8
             };
-            let color = RGB8 { r: intensity, g: intensity, b: intensity };
-            for led in active.iter_mut() {
-                *led = color;
+            if strobe_split {
+                // Position-light strobe: red port / green starboard
+                let half = active.len() / 2;
+                let red = RGB8 { r: intensity, g: 0, b: 0 };
+                let green = RGB8 { r: 0, g: intensity, b: 0 };
+                for led in active[..half].iter_mut() {
+                    *led = red;
+                }
+                for led in active[half..].iter_mut() {
+                    *led = green;
+                }
+            } else {
+                let color = RGB8 { r: intensity, g: intensity, b: intensity };
+                for led in active.iter_mut() {
+                    *led = color;
+                }
             }
 
             match ws.write(buf.iter().copied()) {
