@@ -9,7 +9,7 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Changed
 
-- Remap AUX strobe switches: AUX8 momentary → white strobe at 80, AUX7 mid → white strobe at 80, AUX7 high → position-light strobe (red port / green starboard) at 80
+- Remap AUX strobe switches: AUX7 3-way off → red/green → white, AUX8 momentary → white strobe at 80
 - Add `strobe_split` field to `LedState` for position-light strobe mode
 
 ### Added

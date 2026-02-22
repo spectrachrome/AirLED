@@ -676,8 +676,8 @@ async fn msp_task(mut uart: Uart<'static, esp_hal::Async>) {
 
                         // AUX7 (channel 11, index 10) 3-position strobe
                         //   pos 1 (low)  → off
-                        //   pos 2 (mid)  → white strobe at 80
-                        //   pos 3 (high) → position-light strobe (red/green) at 80
+                        //   pos 2 (mid)  → position-light strobe (red/green) at 80
+                        //   pos 3 (high) → white strobe at 80
                         // AUX8 (channel 12, index 11) momentary → white strobe at 80
                         // Suppress strobe for first 10s after boot and when FC
                         // reports ArmingForbidden (no valid RX link).
@@ -688,9 +688,9 @@ async fn msp_task(mut uart: Uart<'static, esp_hal::Async>) {
                             let (strobe_level, strobe_split): (u8, bool) = if aux8 > 1800 {
                                 (80, false) // AUX8 momentary → mid white
                             } else if aux7 > 1650 {
-                                (80, true)  // AUX7 pos 3 → position-light (red/green)
+                                (80, false) // AUX7 pos 3 → white
                             } else if aux7 > 1250 {
-                                (80, false) // AUX7 pos 2 → mid white
+                                (80, true)  // AUX7 pos 2 → position-light (red/green)
                             } else {
                                 (0, false)  // off
                             };
@@ -856,22 +856,27 @@ async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
             const STROBE_PERIOD: u32 = STROBE_HALF * 2;
             let peak = aux_strobe;
             let phase = frame_counter % STROBE_PERIOD;
-            let intensity = if phase < STROBE_HALF {
-                ((phase + 1) as u16 * peak as u16 / STROBE_HALF as u16) as u8
+            // Quadratic envelope: sharper attack, faster tail-off
+            let linear = if phase < STROBE_HALF {
+                (phase + 1) * 255 / STROBE_HALF
             } else {
-                let off_phase = phase - STROBE_HALF;
-                ((STROBE_HALF - off_phase) as u16 * peak as u16 / STROBE_HALF as u16) as u8
+                let off = phase - STROBE_HALF;
+                (STROBE_HALF - off) * 255 / STROBE_HALF
             };
+            let intensity =
+                (linear * linear / 255 * peak as u32 / 255) as u8;
             if strobe_split {
                 // Position-light strobe: red port / green starboard
+                // Green scaled to 75% to match perceived red brightness
                 let half = active.len() / 2;
+                let green_val = (intensity as u16 * 3 / 4) as u8;
                 let red = RGB8 { r: intensity, g: 0, b: 0 };
-                let green = RGB8 { r: 0, g: intensity, b: 0 };
+                let green = RGB8 { r: 0, g: green_val, b: 0 };
                 for led in active[..half].iter_mut() {
-                    *led = red;
+                    *led = green;
                 }
                 for led in active[half..].iter_mut() {
-                    *led = green;
+                    *led = red;
                 }
             } else {
                 let color = RGB8 { r: intensity, g: intensity, b: intensity };
