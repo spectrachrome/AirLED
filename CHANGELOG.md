@@ -7,25 +7,41 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ## [Unreleased]
 
+### Changed
+
+- BLE protocol replaced with compact binary encoding (22-byte state snapshot, 1–4 byte commands) — see `docs/binary_protocol.md`
+- State snapshots now fit in 1–2 BLE packets (down from ~15 with JSON)
+- Setter acks reduced to a single byte (`0x00` OK / `0xE0` parse / `0xE1` range)
+- RX write callback processes the full BLE write as a complete command (no newline framing)
+- BLE TX buffer shrunk from 512 to 32 bytes; RX reassembly buffer removed entirely
+
 ### Added
 
-- TX link detection via RC stick channels — if all 4 sticks (AETR) read exactly 1500 µs, no TX is bound; strobe only activates when TX is linked
-- `tx_linked` field exposed in BLE `StateResponse` for app display
+- `TestPattern` command (`0xF0`): triggers a 5-second solid-color episode (red/green/blue/white) at full intensity, bypassing all post-processing
+- `GetVersion` command returning protocol version + firmware semver
+- TX link detection via RC stick channels (±10 deadband around 1500 µs center)
+- `tx_linked` field exposed in BLE state snapshot for app display
+
+### Fixed
+
+- Phantom strobe activation on bench: gate AUX strobe on armed/arming-allowed flight mode so default RC channel values (~1500) can't trigger it with no TX powered on
+- TX link detection: use ±10 deadband around 1500 instead of exact comparison to tolerate FC jitter
+- UART desync: drain stale RX bytes before each MSP_RC poll to prevent misreads after MSP_STATUS timeout
 
 ### Removed
 
+- JSON-over-NUS BLE protocol (`Command` enum, `StateResponse` struct, serde-based parsing/serialization)
+- `serde`, `serde_json_core`, and `heapless` dependencies
 - Wi-Fi AP hotspot, HTTP web UI, and DHCP server (BLE is now the sole control interface)
 - `embassy-net`, `smoltcp`, `edge-dhcp`, and `embedded-io` dependencies
 - `wifi` and `coex` features from `esp-radio` (no longer needed without Wi-Fi)
 
 ### Added
 
-- BLE Nordic UART Service (NUS) for app control via JSON protocol
-- `ble` module (`src/ble.rs`): Command/Response types with serde, command handler, state snapshot builder, JSON serialization helpers — all `no_std`, no heap, unit-testable
+- BLE Nordic UART Service (NUS) for app control
+- `ble` module (`src/ble.rs`): binary command parser, state encoder, version encoder — all `no_std`, no heap, unit-testable
 - `ble_task`: async task advertising as "AirLED", serving NUS GATT service with chunked notifications
-- Newline-delimited JSON protocol over BLE: externally-tagged command enums (`{"GetState":null}`, `{"SetBrightness":{"value":128}}`), flat `StateResponse` struct, plain `"ok\n"` / `"err:reason\n"` acks
 - Auto-push state on BLE connect and on MSP flight mode change via `STATE_CHANGED` signal
-- Chunked BLE notifications (20-byte MTU) for state responses (~250 bytes)
 - MSP flight controller integration over UART1 (GPIO20 RX, GPIO21 TX, 115200 baud)
 - `msp` module (`src/msp.rs`): MSPv1 frame builder, response parser state machine, BOXNAMES decoder, flight mode resolver — all `no_std`, no heap, fully unit-testable
 - `msp_task`: async task polling MSP_STATUS at ~10 Hz, with BOXNAMES discovery at startup
