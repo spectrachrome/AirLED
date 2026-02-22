@@ -31,9 +31,7 @@ use xiao_drone_led_controller::pattern::{
     Animation, ColorScheme, Pulse, RippleEffect, StaticAnim,
 };
 use xiao_drone_led_controller::postfx::{PostEffect, apply_pipeline};
-use xiao_drone_led_controller::ble::{
-    self as ble_proto, HandleResult,
-};
+use xiao_drone_led_controller::ble::{self as ble_proto, HandleResult};
 use xiao_drone_led_controller::state::{
     AnimMode, AnimModeParams, BLE_FLASH, ColorMode, FlightMode, STATE, STATE_CHANGED,
 };
@@ -127,28 +125,16 @@ fn main() -> ! {
 const BLE_CHUNK_SIZE: usize = 20;
 
 
-/// Shared BLE RX reassembly buffer (written by write callback, read by notifier).
-struct BleRxBuf {
-    data: [u8; 256],
-    len: usize,
-}
-
 /// Shared BLE TX response buffer (written by write callback/notifier, sent by notifier).
 struct BleTxBuf {
-    data: [u8; 512],
+    data: [u8; 32],
     len: usize,
     offset: usize,
 }
 
-static BLE_RX: critical_section::Mutex<core::cell::RefCell<BleRxBuf>> =
-    critical_section::Mutex::new(core::cell::RefCell::new(BleRxBuf {
-        data: [0; 256],
-        len: 0,
-    }));
-
 static BLE_TX: critical_section::Mutex<core::cell::RefCell<BleTxBuf>> =
     critical_section::Mutex::new(core::cell::RefCell::new(BleTxBuf {
-        data: [0; 512],
+        data: [0; 32],
         len: 0,
         offset: 0,
     }));
@@ -159,44 +145,26 @@ static BLE_NOTIFY: embassy_sync::signal::Signal<
     (),
 > = embassy_sync::signal::Signal::new();
 
-/// Process a complete command message from the RX buffer.
+/// Process a binary command from the RX write callback.
 ///
-/// Called from the sync write callback. Writes the response into BLE_TX
-/// and signals the notifier.
-fn ble_handle_message(msg: &[u8]) {
-    let Some(cmd) = ble_proto::parse_command(msg) else {
-        // Write error response
-        critical_section::with(|cs| {
-            let mut tx = BLE_TX.borrow_ref_mut(cs);
-            let err = b"err:parse\n";
-            tx.data[..err.len()].copy_from_slice(err);
-            tx.len = err.len();
-            tx.offset = 0;
-        });
-        BLE_NOTIFY.signal(());
-        return;
-    };
-
+/// Writes the response into BLE_TX and signals the notifier.
+fn ble_handle_message(data: &[u8]) {
     // Try to lock state synchronously (should almost always succeed)
     if let Ok(mut state) = STATE.try_lock() {
-        let result = ble_proto::handle_command(&cmd, &mut state);
+        let result = ble_proto::handle_binary_command(data, &mut state);
         critical_section::with(|cs| {
             let mut tx = BLE_TX.borrow_ref_mut(cs);
             tx.offset = 0;
             match result {
                 HandleResult::SendState => {
-                    let resp = ble_proto::build_state_response(&state);
-                    tx.len = ble_proto::serialize_state(&resp, &mut tx.data).unwrap_or(0);
+                    tx.len = ble_proto::encode_state(&state, &mut tx.data);
                 }
-                HandleResult::Ack => {
-                    tx.data[..3].copy_from_slice(b"ok\n");
-                    tx.len = 3;
+                HandleResult::SendVersion => {
+                    tx.len = ble_proto::encode_version(&mut tx.data);
                 }
-                HandleResult::Error(e) => {
-                    let eb = e.as_bytes();
-                    let len = eb.len().min(tx.data.len());
-                    tx.data[..len].copy_from_slice(&eb[..len]);
-                    tx.len = len;
+                HandleResult::Ack(code) => {
+                    tx.data[0] = code;
+                    tx.len = 1;
                 }
             }
         });
@@ -216,10 +184,8 @@ async fn ble_task(mut connector: BleConnector<'static>) {
     let mut ble = Ble::new(&mut connector, current_millis);
 
     loop {
-        // Reset buffers between connections
+        // Reset TX buffer between connections
         critical_section::with(|cs| {
-            let mut rx = BLE_RX.borrow_ref_mut(cs);
-            rx.len = 0;
             let mut tx = BLE_TX.borrow_ref_mut(cs);
             tx.len = 0;
             tx.offset = 0;
@@ -287,35 +253,8 @@ async fn ble_task(mut connector: BleConnector<'static>) {
                 }
             });
 
-            critical_section::with(|cs| {
-                let mut rx = BLE_RX.borrow_ref_mut(cs);
-                let space = rx.data.len() - rx.len;
-                let n = data.len().min(space);
-                let start = rx.len;
-                rx.data[start..start + n].copy_from_slice(&data[..n]);
-                rx.len = start + n;
-            });
-
-            // Check for complete message (newline-delimited)
-            let msg_result = critical_section::with(|cs| {
-                let rx = BLE_RX.borrow_ref(cs);
-                rx.data[..rx.len].iter().position(|&b| b == b'\n')
-            });
-
-            if let Some(nl_pos) = msg_result {
-                // Extract message and shift remainder
-                let mut msg = [0u8; 256];
-                let msg_len = critical_section::with(|cs| {
-                    let mut rx = BLE_RX.borrow_ref_mut(cs);
-                    msg[..nl_pos].copy_from_slice(&rx.data[..nl_pos]);
-                    let total = rx.len;
-                    let remaining = total - nl_pos - 1;
-                    rx.data.copy_within(nl_pos + 1..total, 0);
-                    rx.len = remaining;
-                    nl_pos
-                });
-                ble_handle_message(&msg[..msg_len]);
-            }
+            // Binary protocol: each BLE write is a complete command (no framing)
+            ble_handle_message(data);
         };
 
         // Read callback for NUS TX (unused — we use notifications)
@@ -385,16 +324,14 @@ async fn ble_task(mut connector: BleConnector<'static>) {
                         // Command response queued — loop back to send chunks
                     }
                     futures::future::Either::Right(_) => {
-                        // State changed — snapshot and queue
+                        // State changed — encode and queue binary snapshot
                         let state = STATE.lock().await;
-                        let resp = ble_proto::build_state_response(&state);
-                        drop(state);
                         critical_section::with(|cs| {
                             let mut tx = BLE_TX.borrow_ref_mut(cs);
-                            tx.len = ble_proto::serialize_state(&resp, &mut tx.data)
-                                .unwrap_or(0);
+                            tx.len = ble_proto::encode_state(&state, &mut tx.data);
                             tx.offset = 0;
                         });
+                        drop(state);
                         // Loop back to send chunks
                     }
                 }

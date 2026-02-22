@@ -1,133 +1,234 @@
-//! BLE Nordic UART Service (NUS) protocol layer.
+//! BLE Nordic UART Service (NUS) binary protocol layer.
 //!
-//! Defines the JSON command/response protocol used over BLE NUS.
-//! Commands are received as JSON on the RX characteristic, responses
-//! are sent as JSON (or plain strings) on the TX characteristic.
-
-use heapless::String as HString;
-use serde::{Deserialize, Serialize};
+//! Implements the AirLED Binary BLE Protocol v1 (see `docs/binary_protocol.md`).
+//! Commands are received as compact binary frames on the RX characteristic,
+//! responses are sent as binary on the TX characteristic.
 
 use crate::state::{AnimMode, AnimModeParams, ColorMode, FlightMode, LedState};
 
 /// Maximum number of active LEDs (mirrors `MAX_LEDS` in main).
 const MAX_NUM_LEDS: u16 = 200;
 
+/// Current protocol version.
+const PROTOCOL_VERSION: u8 = 1;
+
+/// Firmware version (from Cargo.toml).
+const FW_MAJOR: u8 = 0;
+const FW_MINOR: u8 = 1;
+const FW_PATCH: u8 = 0;
+
 // ---------------------------------------------------------------------------
-// Command (app → ESP, deserialize from JSON)
+// Command IDs (app → device)
 // ---------------------------------------------------------------------------
 
-/// Commands received from the app over BLE NUS RX characteristic.
+const CMD_GET_STATE: u8 = 0x01;
+const CMD_GET_VERSION: u8 = 0x02;
+const CMD_SET_BRIGHTNESS: u8 = 0x10;
+const CMD_SET_NUM_LEDS: u8 = 0x11;
+const CMD_SET_FPS: u8 = 0x12;
+const CMD_SET_MAX_CURRENT: u8 = 0x13;
+const CMD_SET_COLOR_MODE: u8 = 0x14;
+const CMD_SET_ANIM_MODE: u8 = 0x15;
+const CMD_SET_COLOR_BALANCE: u8 = 0x16;
+const CMD_SET_USE_HSI: u8 = 0x17;
+const CMD_SET_HUE_SPEED: u8 = 0x18;
+const CMD_SET_PULSE_SPEED: u8 = 0x19;
+const CMD_SET_PULSE_MIN_BRT: u8 = 0x1A;
+const CMD_SET_RIPPLE_SPEED: u8 = 0x1B;
+const CMD_SET_RIPPLE_WIDTH: u8 = 0x1C;
+const CMD_SET_RIPPLE_DECAY: u8 = 0x1D;
+
+// ---------------------------------------------------------------------------
+// Response codes (device → app)
+// ---------------------------------------------------------------------------
+
+/// Command accepted.
+pub const RSP_OK: u8 = 0x00;
+/// State snapshot response ID.
+pub const RSP_STATE: u8 = 0x01;
+/// Version response ID.
+pub const RSP_VERSION: u8 = 0x02;
+/// Unknown or malformed command.
+pub const RSP_ERR_PARSE: u8 = 0xE0;
+/// Value out of valid range.
+pub const RSP_ERR_RANGE: u8 = 0xE1;
+
+// ---------------------------------------------------------------------------
+// Result type
+// ---------------------------------------------------------------------------
+
+/// Result of handling a binary command.
+pub enum HandleResult {
+    /// Send the full state snapshot (22 bytes).
+    SendState,
+    /// Send the version response (5 bytes).
+    SendVersion,
+    /// Send a 1-byte ack/error code.
+    Ack(u8),
+}
+
+// ---------------------------------------------------------------------------
+// Command parsing + handling (combined)
+// ---------------------------------------------------------------------------
+
+/// Parse and apply a binary command to the shared [`LedState`].
 ///
-/// Uses serde's default externally-tagged representation:
-/// `{"GetState":null}` or `{"SetBrightness":{"value":128}}`.
-#[derive(Deserialize)]
-pub enum Command {
-    GetState,
-    SetBrightness { value: u8 },
-    SetNumLeds { value: u16 },
-    SetFps { value: u8 },
-    SetMaxCurrent { value: u32 },
-    SetColorMode { mode: HString<16> },
-    SetAnimMode { mode: HString<16> },
-    SetColorBalance { r: u8, g: u8, b: u8 },
-    SetUseHsi { value: bool },
-    SetHueSpeed { value: u8 },
-    SetPulseSpeed { value: u16 },
-    SetPulseMinBrightness { value: u8 },
-    SetRippleSpeed { value: u8 },
-    SetRippleWidth { value: u8 },
-    SetRippleDecay { value: u8 },
-}
+/// Returns what response to send, or a 1-byte error code on failure.
+pub fn handle_binary_command(data: &[u8], state: &mut LedState) -> HandleResult {
+    if data.is_empty() {
+        return HandleResult::Ack(RSP_ERR_PARSE);
+    }
 
-// ---------------------------------------------------------------------------
-// Response (ESP → app, serialize to JSON)
-// ---------------------------------------------------------------------------
+    match data[0] {
+        CMD_GET_STATE => HandleResult::SendState,
+        CMD_GET_VERSION => HandleResult::SendVersion,
 
-/// Full state snapshot sent to the app.
-#[derive(Serialize)]
-pub struct StateResponse {
-    pub brightness: u8,
-    pub num_leds: u16,
-    pub fps: u8,
-    pub max_current_ma: u32,
-    pub color_mode: &'static str,
-    pub anim_mode: &'static str,
-    pub bal_r: u8,
-    pub bal_g: u8,
-    pub bal_b: u8,
-    pub use_hsi: bool,
-    pub hue_speed: u8,
-    pub pulse_speed: u16,
-    pub pulse_min_brightness: u8,
-    pub ripple_speed: u8,
-    pub ripple_width: u8,
-    pub ripple_decay: u8,
-    pub fc_connected: bool,
-    pub flight_mode: &'static str,
-    pub tx_linked: bool,
-}
+        CMD_SET_BRIGHTNESS if data.len() >= 2 => {
+            state.brightness = data[1];
+            HandleResult::Ack(RSP_OK)
+        }
+        CMD_SET_NUM_LEDS if data.len() >= 3 => {
+            let val = u16::from_le_bytes([data[1], data[2]]);
+            if !(1..=MAX_NUM_LEDS).contains(&val) {
+                return HandleResult::Ack(RSP_ERR_RANGE);
+            }
+            state.num_leds = val;
+            HandleResult::Ack(RSP_OK)
+        }
+        CMD_SET_FPS if data.len() >= 2 => {
+            let val = data[1];
+            if !(1..=150).contains(&val) {
+                return HandleResult::Ack(RSP_ERR_RANGE);
+            }
+            state.fps = val;
+            HandleResult::Ack(RSP_OK)
+        }
+        CMD_SET_MAX_CURRENT if data.len() >= 3 => {
+            let val = u16::from_le_bytes([data[1], data[2]]);
+            if !(100..=2500).contains(&val) {
+                return HandleResult::Ack(RSP_ERR_RANGE);
+            }
+            state.max_current_ma = val as u32;
+            HandleResult::Ack(RSP_OK)
+        }
+        CMD_SET_COLOR_MODE if data.len() >= 2 => {
+            let mode = match data[1] {
+                0 => ColorMode::SolidGreen,
+                1 => ColorMode::SolidRed,
+                2 => ColorMode::Split,
+                3 => ColorMode::Rainbow,
+                _ => return HandleResult::Ack(RSP_ERR_RANGE),
+            };
+            state.color_mode = mode;
+            HandleResult::Ack(RSP_OK)
+        }
+        CMD_SET_ANIM_MODE if data.len() >= 2 => {
+            let mode = match data[1] {
+                0 => AnimMode::Static,
+                1 => AnimMode::Pulse,
+                2 => AnimMode::Ripple,
+                _ => return HandleResult::Ack(RSP_ERR_RANGE),
+            };
+            if mode != state.anim_mode {
+                state.anim_mode = mode;
+                state.anim_params = AnimModeParams::default_for(mode);
+            }
+            HandleResult::Ack(RSP_OK)
+        }
+        CMD_SET_COLOR_BALANCE if data.len() >= 4 => {
+            state.color_bal_r = data[1];
+            state.color_bal_g = data[2];
+            state.color_bal_b = data[3];
+            HandleResult::Ack(RSP_OK)
+        }
+        CMD_SET_USE_HSI if data.len() >= 2 => {
+            state.use_hsi = data[1] != 0;
+            HandleResult::Ack(RSP_OK)
+        }
+        CMD_SET_HUE_SPEED if data.len() >= 2 => {
+            let val = data[1];
+            if !(1..=10).contains(&val) {
+                return HandleResult::Ack(RSP_ERR_RANGE);
+            }
+            state.color_params.hue_speed = val;
+            HandleResult::Ack(RSP_OK)
+        }
+        CMD_SET_PULSE_SPEED if data.len() >= 3 => {
+            let val = u16::from_le_bytes([data[1], data[2]]);
+            if !(100..=2000).contains(&val) {
+                return HandleResult::Ack(RSP_ERR_RANGE);
+            }
+            if let AnimModeParams::Pulse { speed, .. } = &mut state.anim_params {
+                *speed = val;
+            }
+            HandleResult::Ack(RSP_OK)
+        }
+        CMD_SET_PULSE_MIN_BRT if data.len() >= 2 => {
+            let val = data[1];
+            if val > 80 {
+                return HandleResult::Ack(RSP_ERR_RANGE);
+            }
+            if let AnimModeParams::Pulse {
+                min_intensity_pct, ..
+            } = &mut state.anim_params
+            {
+                *min_intensity_pct = val;
+            }
+            HandleResult::Ack(RSP_OK)
+        }
+        CMD_SET_RIPPLE_SPEED if data.len() >= 2 => {
+            let val = data[1];
+            if !(5..=50).contains(&val) {
+                return HandleResult::Ack(RSP_ERR_RANGE);
+            }
+            if let AnimModeParams::Ripple { speed_x10, .. } = &mut state.anim_params {
+                *speed_x10 = val;
+            }
+            HandleResult::Ack(RSP_OK)
+        }
+        CMD_SET_RIPPLE_WIDTH if data.len() >= 2 => {
+            let val = data[1];
+            if val < 10 {
+                return HandleResult::Ack(RSP_ERR_RANGE);
+            }
+            if let AnimModeParams::Ripple { width_x10, .. } = &mut state.anim_params {
+                *width_x10 = val;
+            }
+            HandleResult::Ack(RSP_OK)
+        }
+        CMD_SET_RIPPLE_DECAY if data.len() >= 2 => {
+            let val = data[1];
+            if !(90..=99).contains(&val) {
+                return HandleResult::Ack(RSP_ERR_RANGE);
+            }
+            if let AnimModeParams::Ripple { decay_pct, .. } = &mut state.anim_params {
+                *decay_pct = val;
+            }
+            HandleResult::Ack(RSP_OK)
+        }
 
-// ---------------------------------------------------------------------------
-// Mapping helpers
-// ---------------------------------------------------------------------------
+        // Known command ID but insufficient payload bytes
+        CMD_SET_BRIGHTNESS | CMD_SET_FPS | CMD_SET_COLOR_MODE | CMD_SET_ANIM_MODE
+        | CMD_SET_USE_HSI | CMD_SET_HUE_SPEED | CMD_SET_PULSE_MIN_BRT
+        | CMD_SET_RIPPLE_SPEED | CMD_SET_RIPPLE_WIDTH | CMD_SET_RIPPLE_DECAY => {
+            HandleResult::Ack(RSP_ERR_PARSE)
+        }
+        CMD_SET_NUM_LEDS | CMD_SET_MAX_CURRENT | CMD_SET_PULSE_SPEED
+        | CMD_SET_COLOR_BALANCE => HandleResult::Ack(RSP_ERR_PARSE),
 
-/// Map a [`ColorMode`] to its wire-format string key.
-pub fn color_mode_str(mode: ColorMode) -> &'static str {
-    match mode {
-        ColorMode::SolidGreen => "solid_green",
-        ColorMode::SolidRed => "solid_red",
-        ColorMode::Split => "split",
-        ColorMode::Rainbow => "rainbow",
+        _ => HandleResult::Ack(RSP_ERR_PARSE),
     }
 }
 
-/// Map a [`AnimMode`] to its wire-format string key.
-pub fn anim_mode_str(mode: AnimMode) -> &'static str {
-    match mode {
-        AnimMode::Static => "static",
-        AnimMode::Pulse => "pulse",
-        AnimMode::Ripple => "ripple",
-    }
-}
-
-/// Map a [`FlightMode`] to its wire-format string key.
-fn flight_mode_str(mode: FlightMode) -> &'static str {
-    match mode {
-        FlightMode::ArmingForbidden => "arming_forbidden",
-        FlightMode::ArmingAllowed => "arming_allowed",
-        FlightMode::Armed => "armed",
-        FlightMode::Failsafe => "failsafe",
-    }
-}
-
-/// Parse a color mode string into a [`ColorMode`].
-fn parse_color_mode(s: &str) -> Option<ColorMode> {
-    match s {
-        "solid_green" => Some(ColorMode::SolidGreen),
-        "solid_red" => Some(ColorMode::SolidRed),
-        "split" => Some(ColorMode::Split),
-        "rainbow" => Some(ColorMode::Rainbow),
-        _ => None,
-    }
-}
-
-/// Parse an animation mode string into an [`AnimMode`].
-fn parse_anim_mode(s: &str) -> Option<AnimMode> {
-    match s {
-        "static" => Some(AnimMode::Static),
-        "pulse" => Some(AnimMode::Pulse),
-        "ripple" => Some(AnimMode::Ripple),
-        _ => None,
-    }
-}
-
 // ---------------------------------------------------------------------------
-// State snapshot
+// State encoding
 // ---------------------------------------------------------------------------
 
-/// Build a [`StateResponse`] from the current [`LedState`].
-pub fn build_state_response(state: &LedState) -> StateResponse {
-    let (pulse_speed, pulse_min_brightness) = match state.anim_params {
+/// Encode the full state snapshot into `buf` (must be >= 22 bytes).
+///
+/// Returns the number of bytes written (always 22).
+pub fn encode_state(state: &LedState, buf: &mut [u8]) -> usize {
+    let (pulse_speed, pulse_min_brt) = match state.anim_params {
         AnimModeParams::Pulse {
             speed,
             min_intensity_pct,
@@ -143,158 +244,64 @@ pub fn build_state_response(state: &LedState) -> StateResponse {
         _ => (15, 190, 97),
     };
 
-    StateResponse {
-        brightness: state.brightness,
-        num_leds: state.num_leds,
-        fps: state.fps,
-        max_current_ma: state.max_current_ma,
-        color_mode: color_mode_str(state.color_mode),
-        anim_mode: anim_mode_str(state.anim_mode),
-        bal_r: state.color_bal_r,
-        bal_g: state.color_bal_g,
-        bal_b: state.color_bal_b,
-        use_hsi: state.use_hsi,
-        hue_speed: state.color_params.hue_speed,
-        pulse_speed,
-        pulse_min_brightness,
-        ripple_speed,
-        ripple_width,
-        ripple_decay,
-        fc_connected: state.fc_connected,
-        flight_mode: flight_mode_str(state.flight_mode),
-        tx_linked: state.tx_linked,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Command handling
-// ---------------------------------------------------------------------------
-
-/// Result of handling a command.
-pub enum HandleResult {
-    /// Send the full state as JSON.
-    SendState,
-    /// Send a simple "ok\n" ack.
-    Ack,
-    /// Send an error string.
-    Error(&'static str),
-}
-
-/// Apply a [`Command`] to the shared [`LedState`], returning what response to send.
-pub fn handle_command(cmd: &Command, state: &mut LedState) -> HandleResult {
-    match cmd {
-        Command::GetState => HandleResult::SendState,
-        Command::SetBrightness { value } => {
-            state.brightness = *value;
-            HandleResult::Ack
-        }
-        Command::SetNumLeds { value } => {
-            state.num_leds = (*value).clamp(1, MAX_NUM_LEDS);
-            HandleResult::Ack
-        }
-        Command::SetFps { value } => {
-            state.fps = (*value).clamp(1, 150);
-            HandleResult::Ack
-        }
-        Command::SetMaxCurrent { value } => {
-            state.max_current_ma = (*value).clamp(100, 2500);
-            HandleResult::Ack
-        }
-        Command::SetColorMode { mode } => match parse_color_mode(mode.as_str()) {
-            Some(m) => {
-                state.color_mode = m;
-                HandleResult::Ack
-            }
-            None => HandleResult::Error("err:unknown_color_mode\n"),
-        },
-        Command::SetAnimMode { mode } => match parse_anim_mode(mode.as_str()) {
-            Some(m) => {
-                if m != state.anim_mode {
-                    state.anim_mode = m;
-                    state.anim_params = AnimModeParams::default_for(m);
-                }
-                HandleResult::Ack
-            }
-            None => HandleResult::Error("err:unknown_anim_mode\n"),
-        },
-        Command::SetColorBalance { r, g, b } => {
-            state.color_bal_r = *r;
-            state.color_bal_g = *g;
-            state.color_bal_b = *b;
-            HandleResult::Ack
-        }
-        Command::SetUseHsi { value } => {
-            state.use_hsi = *value;
-            HandleResult::Ack
-        }
-        Command::SetHueSpeed { value } => {
-            state.color_params.hue_speed = (*value).clamp(1, 10);
-            HandleResult::Ack
-        }
-        Command::SetPulseSpeed { value } => {
-            if let AnimModeParams::Pulse { speed, .. } = &mut state.anim_params {
-                *speed = (*value).clamp(100, 2000);
-            }
-            HandleResult::Ack
-        }
-        Command::SetPulseMinBrightness { value } => {
-            if let AnimModeParams::Pulse {
-                min_intensity_pct, ..
-            } = &mut state.anim_params
-            {
-                *min_intensity_pct = (*value).min(80);
-            }
-            HandleResult::Ack
-        }
-        Command::SetRippleSpeed { value } => {
-            if let AnimModeParams::Ripple { speed_x10, .. } = &mut state.anim_params {
-                *speed_x10 = (*value).clamp(5, 50);
-            }
-            HandleResult::Ack
-        }
-        Command::SetRippleWidth { value } => {
-            if let AnimModeParams::Ripple { width_x10, .. } = &mut state.anim_params {
-                *width_x10 = (*value).clamp(10, 255);
-            }
-            HandleResult::Ack
-        }
-        Command::SetRippleDecay { value } => {
-            if let AnimModeParams::Ripple { decay_pct, .. } = &mut state.anim_params {
-                *decay_pct = (*value).clamp(90, 99);
-            }
-            HandleResult::Ack
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Serialization helpers
-// ---------------------------------------------------------------------------
-
-/// Parse a JSON command from a byte slice.
-///
-/// Returns the parsed command or `None` on failure.
-pub fn parse_command(data: &[u8]) -> Option<Command> {
-    // Strip trailing newline if present
-    let data = if data.last() == Some(&b'\n') {
-        &data[..data.len() - 1]
-    } else {
-        data
+    let color_mode: u8 = match state.color_mode {
+        ColorMode::SolidGreen => 0,
+        ColorMode::SolidRed => 1,
+        ColorMode::Split => 2,
+        ColorMode::Rainbow => 3,
     };
-    serde_json_core::from_slice::<Command>(data).ok().map(|(cmd, _)| cmd)
+    let anim_mode: u8 = match state.anim_mode {
+        AnimMode::Static => 0,
+        AnimMode::Pulse => 1,
+        AnimMode::Ripple => 2,
+    };
+
+    let flags: u8 = (state.fc_connected as u8)
+        | ((state.tx_linked as u8) << 1)
+        | ((matches!(state.flight_mode, FlightMode::Armed) as u8) << 2)
+        | ((matches!(state.flight_mode, FlightMode::Failsafe) as u8) << 3)
+        | ((matches!(state.flight_mode, FlightMode::ArmingAllowed) as u8) << 4);
+
+    let num_leds = state.num_leds.to_le_bytes();
+    let max_current = (state.max_current_ma as u16).to_le_bytes();
+    let pulse_speed_le = pulse_speed.to_le_bytes();
+
+    buf[0] = RSP_STATE;
+    buf[1] = PROTOCOL_VERSION;
+    buf[2] = state.brightness;
+    buf[3] = num_leds[0];
+    buf[4] = num_leds[1];
+    buf[5] = state.fps;
+    buf[6] = max_current[0];
+    buf[7] = max_current[1];
+    buf[8] = color_mode;
+    buf[9] = anim_mode;
+    buf[10] = state.color_bal_r;
+    buf[11] = state.color_bal_g;
+    buf[12] = state.color_bal_b;
+    buf[13] = state.use_hsi as u8;
+    buf[14] = state.color_params.hue_speed;
+    buf[15] = pulse_speed_le[0];
+    buf[16] = pulse_speed_le[1];
+    buf[17] = pulse_min_brt;
+    buf[18] = ripple_speed;
+    buf[19] = ripple_width;
+    buf[20] = ripple_decay;
+    buf[21] = flags;
+
+    22
 }
 
-/// Serialize a [`StateResponse`] into a buffer, appending a newline delimiter.
+/// Encode the version response into `buf` (must be >= 5 bytes).
 ///
-/// Returns the number of bytes written, or `None` if the buffer is too small.
-pub fn serialize_state(resp: &StateResponse, buf: &mut [u8]) -> Option<usize> {
-    let n = serde_json_core::to_slice(resp, buf).ok()?;
-    if n < buf.len() {
-        buf[n] = b'\n';
-        Some(n + 1)
-    } else {
-        None
-    }
+/// Returns the number of bytes written (always 5).
+pub fn encode_version(buf: &mut [u8]) -> usize {
+    buf[0] = RSP_VERSION;
+    buf[1] = PROTOCOL_VERSION;
+    buf[2] = FW_MAJOR;
+    buf[3] = FW_MINOR;
+    buf[4] = FW_PATCH;
+    5
 }
 
 // ---------------------------------------------------------------------------
@@ -310,83 +317,148 @@ mod tests {
     }
 
     #[test]
-    fn parse_get_state() {
-        let cmd = parse_command(b"{\"GetState\":null}").unwrap();
-        assert!(matches!(cmd, Command::GetState));
-    }
-
-    #[test]
-    fn parse_get_state_with_newline() {
-        let cmd = parse_command(b"{\"GetState\":null}\n").unwrap();
-        assert!(matches!(cmd, Command::GetState));
-    }
-
-    #[test]
-    fn parse_set_brightness() {
-        let cmd = parse_command(b"{\"SetBrightness\":{\"value\":128}}").unwrap();
-        assert!(matches!(cmd, Command::SetBrightness { value: 128 }));
-    }
-
-    #[test]
-    fn parse_set_color_mode() {
-        let cmd = parse_command(b"{\"SetColorMode\":{\"mode\":\"rainbow\"}}").unwrap();
-        if let Command::SetColorMode { mode } = cmd {
-            assert_eq!(mode.as_str(), "rainbow");
-        } else {
-            panic!("expected SetColorMode");
-        }
-    }
-
-    #[test]
-    fn parse_invalid_json() {
-        assert!(parse_command(b"not json").is_none());
-    }
-
-    #[test]
-    fn handle_get_state_returns_send_state() {
+    fn get_state_returns_send_state() {
         let mut state = default_state();
-        let result = handle_command(&Command::GetState, &mut state);
+        let result = handle_binary_command(&[CMD_GET_STATE], &mut state);
         assert!(matches!(result, HandleResult::SendState));
     }
 
     #[test]
-    fn handle_set_brightness() {
+    fn get_version_returns_send_version() {
         let mut state = default_state();
-        let result = handle_command(&Command::SetBrightness { value: 42 }, &mut state);
-        assert!(matches!(result, HandleResult::Ack));
+        let result = handle_binary_command(&[CMD_GET_VERSION], &mut state);
+        assert!(matches!(result, HandleResult::SendVersion));
+    }
+
+    #[test]
+    fn set_brightness() {
+        let mut state = default_state();
+        let result = handle_binary_command(&[CMD_SET_BRIGHTNESS, 42], &mut state);
+        assert!(matches!(result, HandleResult::Ack(RSP_OK)));
         assert_eq!(state.brightness, 42);
     }
 
     #[test]
-    fn handle_set_num_leds_clamps() {
+    fn set_num_leds() {
         let mut state = default_state();
-        handle_command(&Command::SetNumLeds { value: 999 }, &mut state);
-        assert_eq!(state.num_leds, MAX_NUM_LEDS);
+        let val: u16 = 100;
+        let bytes = val.to_le_bytes();
+        let result =
+            handle_binary_command(&[CMD_SET_NUM_LEDS, bytes[0], bytes[1]], &mut state);
+        assert!(matches!(result, HandleResult::Ack(RSP_OK)));
+        assert_eq!(state.num_leds, 100);
     }
 
     #[test]
-    fn handle_set_anim_mode_resets_params() {
+    fn set_num_leds_out_of_range() {
+        let mut state = default_state();
+        let val: u16 = 999;
+        let bytes = val.to_le_bytes();
+        let result =
+            handle_binary_command(&[CMD_SET_NUM_LEDS, bytes[0], bytes[1]], &mut state);
+        assert!(matches!(result, HandleResult::Ack(RSP_ERR_RANGE)));
+    }
+
+    #[test]
+    fn set_color_mode_rainbow() {
+        let mut state = default_state();
+        let result = handle_binary_command(&[CMD_SET_COLOR_MODE, 3], &mut state);
+        assert!(matches!(result, HandleResult::Ack(RSP_OK)));
+        assert_eq!(state.color_mode, ColorMode::Rainbow);
+    }
+
+    #[test]
+    fn set_color_mode_invalid() {
+        let mut state = default_state();
+        let result = handle_binary_command(&[CMD_SET_COLOR_MODE, 99], &mut state);
+        assert!(matches!(result, HandleResult::Ack(RSP_ERR_RANGE)));
+    }
+
+    #[test]
+    fn set_anim_mode_resets_params() {
         let mut state = default_state();
         state.anim_mode = AnimMode::Pulse;
         state.anim_params = AnimModeParams::Pulse {
             speed: 1234,
             min_intensity_pct: 77,
         };
-        let mode: HString<16> = HString::try_from("ripple").unwrap();
-        handle_command(&Command::SetAnimMode { mode }, &mut state);
+        let result = handle_binary_command(&[CMD_SET_ANIM_MODE, 2], &mut state);
+        assert!(matches!(result, HandleResult::Ack(RSP_OK)));
         assert_eq!(state.anim_mode, AnimMode::Ripple);
         assert!(matches!(state.anim_params, AnimModeParams::Ripple { .. }));
     }
 
     #[test]
-    fn serialize_state_response() {
+    fn set_color_balance() {
+        let mut state = default_state();
+        let result =
+            handle_binary_command(&[CMD_SET_COLOR_BALANCE, 0xFF, 0xC8, 0xDC], &mut state);
+        assert!(matches!(result, HandleResult::Ack(RSP_OK)));
+        assert_eq!(state.color_bal_r, 255);
+        assert_eq!(state.color_bal_g, 200);
+        assert_eq!(state.color_bal_b, 220);
+    }
+
+    #[test]
+    fn empty_command_returns_parse_error() {
+        let mut state = default_state();
+        let result = handle_binary_command(&[], &mut state);
+        assert!(matches!(result, HandleResult::Ack(RSP_ERR_PARSE)));
+    }
+
+    #[test]
+    fn unknown_command_returns_parse_error() {
+        let mut state = default_state();
+        let result = handle_binary_command(&[0xFF], &mut state);
+        assert!(matches!(result, HandleResult::Ack(RSP_ERR_PARSE)));
+    }
+
+    #[test]
+    fn truncated_command_returns_parse_error() {
+        let mut state = default_state();
+        // CMD_SET_NUM_LEDS needs 3 bytes, only 2 provided
+        let result = handle_binary_command(&[CMD_SET_NUM_LEDS, 0x01], &mut state);
+        assert!(matches!(result, HandleResult::Ack(RSP_ERR_PARSE)));
+    }
+
+    #[test]
+    fn encode_state_snapshot() {
         let state = default_state();
-        let resp = build_state_response(&state);
-        let mut buf = [0u8; 512];
-        let n = serialize_state(&resp, &mut buf).unwrap();
-        let json = core::str::from_utf8(&buf[..n]).unwrap();
-        assert!(json.ends_with('\n'));
-        assert!(json.contains("\"brightness\""));
-        assert!(json.contains("\"color_mode\""));
+        let mut buf = [0u8; 32];
+        let n = encode_state(&state, &mut buf);
+        assert_eq!(n, 22);
+        assert_eq!(buf[0], RSP_STATE);
+        assert_eq!(buf[1], PROTOCOL_VERSION);
+        assert_eq!(buf[2], state.brightness);
+        // num_leds = 180 = 0x00B4 LE
+        assert_eq!(buf[3], 0xB4);
+        assert_eq!(buf[4], 0x00);
+        assert_eq!(buf[5], state.fps);
+        // flags: fc_connected=false → 0x00
+        assert_eq!(buf[21], 0x00);
+    }
+
+    #[test]
+    fn encode_version_response() {
+        let mut buf = [0u8; 8];
+        let n = encode_version(&mut buf);
+        assert_eq!(n, 5);
+        assert_eq!(buf[0], RSP_VERSION);
+        assert_eq!(buf[1], PROTOCOL_VERSION);
+        assert_eq!(buf[2], FW_MAJOR);
+        assert_eq!(buf[3], FW_MINOR);
+        assert_eq!(buf[4], FW_PATCH);
+    }
+
+    #[test]
+    fn encode_state_flags() {
+        let mut state = default_state();
+        state.fc_connected = true;
+        state.tx_linked = true;
+        state.flight_mode = FlightMode::Armed;
+        let mut buf = [0u8; 22];
+        encode_state(&state, &mut buf);
+        // flags: fc_connected=1, tx_linked=1<<1, armed=1<<2 = 0b00000111 = 0x07
+        assert_eq!(buf[21], 0x07);
     }
 }
