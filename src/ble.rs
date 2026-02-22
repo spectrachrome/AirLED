@@ -4,7 +4,7 @@
 //! Commands are received as compact binary frames on the RX characteristic,
 //! responses are sent as binary on the TX characteristic.
 
-use crate::state::{AnimMode, AnimModeParams, ColorMode, FlightMode, LedState};
+use crate::state::{AnimMode, AnimModeParams, ColorMode, FlightMode, LedState, TEST_PATTERN};
 
 /// Maximum number of active LEDs (mirrors `MAX_LEDS` in main).
 const MAX_NUM_LEDS: u16 = 200;
@@ -37,6 +37,7 @@ const CMD_SET_PULSE_MIN_BRT: u8 = 0x1A;
 const CMD_SET_RIPPLE_SPEED: u8 = 0x1B;
 const CMD_SET_RIPPLE_WIDTH: u8 = 0x1C;
 const CMD_SET_RIPPLE_DECAY: u8 = 0x1D;
+const CMD_TEST_PATTERN: u8 = 0xF0;
 
 // ---------------------------------------------------------------------------
 // Response codes (device → app)
@@ -207,10 +208,19 @@ pub fn handle_binary_command(data: &[u8], state: &mut LedState) -> HandleResult 
             HandleResult::Ack(RSP_OK)
         }
 
+        CMD_TEST_PATTERN if data.len() >= 2 => {
+            if data[1] > 3 {
+                return HandleResult::Ack(RSP_ERR_RANGE);
+            }
+            TEST_PATTERN.signal(data[1]);
+            HandleResult::Ack(RSP_OK)
+        }
+
         // Known command ID but insufficient payload bytes
         CMD_SET_BRIGHTNESS | CMD_SET_FPS | CMD_SET_COLOR_MODE | CMD_SET_ANIM_MODE
         | CMD_SET_USE_HSI | CMD_SET_HUE_SPEED | CMD_SET_PULSE_MIN_BRT
-        | CMD_SET_RIPPLE_SPEED | CMD_SET_RIPPLE_WIDTH | CMD_SET_RIPPLE_DECAY => {
+        | CMD_SET_RIPPLE_SPEED | CMD_SET_RIPPLE_WIDTH | CMD_SET_RIPPLE_DECAY
+        | CMD_TEST_PATTERN => {
             HandleResult::Ack(RSP_ERR_PARSE)
         }
         CMD_SET_NUM_LEDS | CMD_SET_MAX_CURRENT | CMD_SET_PULSE_SPEED

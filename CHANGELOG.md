@@ -25,6 +25,7 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 - TX link detection via RC stick channels — if all 4 sticks (AETR) read exactly 1500 µs, no TX is bound; strobe only activates when TX is linked
 - `tx_linked` field exposed in BLE state snapshot for app display
 - `GetVersion` command returning protocol version + firmware semver
+- `TestPattern` command (`0xF0`): triggers a 5-second solid-color episode (red/green/blue/white) at full intensity, bypassing all post-processing
 
 ### Removed
 

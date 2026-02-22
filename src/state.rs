@@ -172,6 +172,12 @@ impl Default for LedState {
 /// The LED task picks this up and plays a blue flash sequence over 750 ms.
 pub static BLE_FLASH: Signal<CriticalSectionRawMutex, u8> = Signal::new();
 
+/// Test pattern request: color code (0=red, 1=green, 2=blue, 3=white).
+///
+/// The LED task picks this up and plays a 5-second solid color episode,
+/// bypassing all post-processing (gamma, balance, current limit).
+pub static TEST_PATTERN: Signal<CriticalSectionRawMutex, u8> = Signal::new();
+
 /// Signal to notify the BLE task that state has changed.
 ///
 /// Any task that modifies state can signal this to trigger a BLE push notification.

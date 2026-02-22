@@ -34,6 +34,7 @@ use xiao_drone_led_controller::postfx::{PostEffect, apply_pipeline};
 use xiao_drone_led_controller::ble::{self as ble_proto, HandleResult};
 use xiao_drone_led_controller::state::{
     AnimMode, AnimModeParams, BLE_FLASH, ColorMode, FlightMode, STATE, STATE_CHANGED,
+    TEST_PATTERN,
 };
 use static_cell::StaticCell;
 
@@ -692,12 +693,27 @@ async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
     let mut flash_count: u8 = 0;
     let mut flash_total_frames: u32 = 0;
 
+    // Test pattern state: wall-clock deadline, solid color to display
+    let mut test_deadline: Option<embassy_time::Instant> = None;
+    let mut test_color = RGB8 { r: 0, g: 0, b: 0 };
+
     loop {
         // Check for new BLE flash request
         if let Some(count) = BLE_FLASH.try_take() {
             flash_count = count;
             // Will be computed after we know FPS below
             flash_remaining = u32::MAX; // sentinel — set properly after FPS read
+        }
+
+        // Check for new test pattern request
+        if let Some(color_code) = TEST_PATTERN.try_take() {
+            test_color = match color_code {
+                0 => RGB8 { r: 255, g: 0, b: 0 },
+                1 => RGB8 { r: 0, g: 255, b: 0 },
+                2 => RGB8 { r: 0, g: 0, b: 255 },
+                _ => RGB8 { r: 255, g: 255, b: 255 },
+            };
+            test_deadline = Some(embassy_time::Instant::now() + Duration::from_secs(5));
         }
 
         let state = STATE.lock().await;
@@ -792,6 +808,28 @@ async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
             flash_remaining -= 1;
 
             // Skip normal rendering and post-processing — write directly
+            match ws.write(buf.iter().copied()) {
+                Err(e) if !write_err_logged => {
+                    defmt::warn!("LED write error: {}", defmt::Debug2Format(&e));
+                    write_err_logged = true;
+                }
+                Ok(_) if write_err_logged => {
+                    info!("LED write recovered");
+                    write_err_logged = false;
+                }
+                _ => {}
+            }
+            frame_counter = frame_counter.wrapping_add(1);
+            Timer::after(Duration::from_millis(1000 / fps as u64)).await;
+            continue;
+        }
+
+        // Test pattern override: solid color for 5 seconds, no post-processing
+        if test_deadline.is_some_and(|d| embassy_time::Instant::now() < d) {
+            for led in active.iter_mut() {
+                *led = test_color;
+            }
+
             match ws.write(buf.iter().copied()) {
                 Err(e) if !write_err_logged => {
                     defmt::warn!("LED write error: {}", defmt::Debug2Format(&e));

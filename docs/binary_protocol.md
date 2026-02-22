@@ -54,10 +54,25 @@ Each command ID implies a fixed payload length — no length field needed.
 | 0x1B | `SetRippleSpeed`   | `u8`                 | 2    | 5–50 (×0.1 fixed-point)           |
 | 0x1C | `SetRippleWidth`   | `u8`                 | 2    | 10–255 (×0.1 fixed-point)         |
 | 0x1D | `SetRippleDecay`   | `u8`                 | 2    | 90–99 (%)                         |
+| 0xF0 | `TestPattern`      | `u8`                 | 2    | 5 s solid color (see table below) |
+
 Command IDs are grouped:
 - `0x01–0x0F` — queries
 - `0x10–0x3F` — setters (user-configurable fields)
-- `0xF0–0xFF` — reserved for future system commands (e.g. save to flash)
+- `0xF0–0xFF` — system commands
+
+### Test Pattern Color (`u8`)
+
+| Value | Color  |
+|-------|--------|
+| 0     | Red    |
+| 1     | Green  |
+| 2     | Blue   |
+| 3     | White  |
+
+Triggers a 5-second solid-color episode at full intensity, bypassing all
+post-processing (gamma, color balance, brightness, current limit).
+A new `TestPattern` command restarts the 5-second timer.
 
 ---
 
