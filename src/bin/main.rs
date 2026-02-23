@@ -148,8 +148,11 @@ static BLE_NOTIFY: embassy_sync::signal::Signal<
 
 /// Process a binary command from the RX write callback.
 ///
-/// Writes the response into BLE_TX and signals the notifier.
+/// Called from the sync write callback. Writes the response into BLE_TX
+/// and signals the notifier.
 fn ble_handle_message(data: &[u8]) {
+    defmt::info!("BLE RX: {} bytes, cmd=0x{:02x}", data.len(), if data.is_empty() { 0 } else { data[0] });
+
     // Try to lock state synchronously (should almost always succeed)
     if let Ok(mut state) = STATE.try_lock() {
         let result = ble_proto::handle_binary_command(data, &mut state);
@@ -176,7 +179,7 @@ fn ble_handle_message(data: &[u8]) {
 /// BLE Nordic UART Service task.
 ///
 /// Advertises as "AirLED", accepts connections, and serves the NUS GATT service.
-/// Commands arrive as JSON on RX; responses go out as notifications on TX.
+/// Commands arrive as binary on RX; responses go out as notifications on TX.
 #[embassy_executor::task]
 async fn ble_task(mut connector: BleConnector<'static>) {
     info!("BLE task started");
@@ -245,6 +248,8 @@ async fn ble_task(mut connector: BleConnector<'static>) {
 
         // Write callback for NUS RX characteristic (sync — runs inside do_work)
         let mut rx_wf = |_offset: usize, data: &[u8]| {
+            defmt::info!("BLE RX: {} bytes", data.len());
+
             // Flash blue on first write (= real client connection confirmed)
             critical_section::with(|cs| {
                 if !BLE_CONNECTED.borrow(cs).get() {
@@ -352,6 +357,14 @@ async fn ble_task(mut connector: BleConnector<'static>) {
     }
 }
 
+/// Drain any stale bytes from the UART RX buffer.
+///
+/// Reads with a 1 ms timeout until no more data arrives, discarding everything.
+async fn drain_uart(uart: &mut Uart<'static, esp_hal::Async>) {
+    let mut byte = [0u8; 1];
+    while let Ok(Ok(_)) = with_timeout(Duration::from_millis(1), AsyncRead::read(uart, &mut byte)).await {}
+}
+
 /// Read bytes from UART until a complete MSP frame is parsed or timeout.
 async fn read_msp_response(
     uart: &mut Uart<'static, esp_hal::Async>,
@@ -443,6 +456,11 @@ async fn msp_task(mut uart: Uart<'static, esp_hal::Async>) {
     let mut rc_tick: u8 = 0;
     let mut logged_rc_once = false;
     let mut tx_linked = false;
+    // Strobe is only allowed when the FC reports Armed or ArmingAllowed.
+    // This is critical: without this gate, the FC may report default RC
+    // channel values (~1500) that fall inside the AUX7 strobe threshold,
+    // causing phantom strobe activation on the bench with no TX powered on.
+    let mut strobe_allowed = false;
 
     loop {
         // Retry box map if we never got it (FC wasn't ready at startup)
@@ -517,6 +535,7 @@ async fn msp_task(mut uart: Uart<'static, esp_hal::Async>) {
                     state.fc_connected = true;
                     state.flight_mode = mode;
                     state.debug_flags = flags;
+                    strobe_allowed = matches!(mode, FlightMode::Armed | FlightMode::ArmingAllowed);
                     drop(state);
                     if changed {
                         STATE_CHANGED.signal(());
@@ -539,6 +558,7 @@ async fn msp_task(mut uart: Uart<'static, esp_hal::Async>) {
             state.aux_strobe = 0;
             state.tx_linked = false;
             tx_linked = false;
+            strobe_allowed = false;
             drop(state);
             // Reset counter to avoid spamming state writes every tick
             error_count = 10;
@@ -547,6 +567,8 @@ async fn msp_task(mut uart: Uart<'static, esp_hal::Async>) {
         // Poll RC channels every tick with short timeout
         rc_tick = rc_tick.wrapping_add(1);
         {
+            // Drain any stale bytes left over from a timed-out MSP_STATUS exchange
+            drain_uart(&mut uart).await;
             let len = msp::build_request(msp::MSP_RC, &[], &mut tx_buf);
             if Write::write_all(&mut uart, &tx_buf[..len]).await.is_ok() {
                 if let Some(frame) =
@@ -570,12 +592,14 @@ async fn msp_task(mut uart: Uart<'static, esp_hal::Async>) {
                         }
 
                         // TX link detection: when no TX is bound all 4 stick
-                        // channels (AETR) sit at exactly 1500 µs.
+                        // channels (AETR) sit near 1500 µs. Use a deadband to
+                        // tolerate jitter/rounding from the FC.
                         if count >= 4 {
-                            let linked = !(rc_channels[0] == 1500
-                                && rc_channels[1] == 1500
-                                && rc_channels[2] == 1500
-                                && rc_channels[3] == 1500);
+                            let near_center = |ch: u16| (1490..=1510).contains(&ch);
+                            let linked = !(near_center(rc_channels[0])
+                                && near_center(rc_channels[1])
+                                && near_center(rc_channels[2])
+                                && near_center(rc_channels[3]));
                             if linked != tx_linked {
                                 info!("MSP: TX link {}", if linked { "up" } else { "down" });
                                 tx_linked = linked;
@@ -591,15 +615,13 @@ async fn msp_task(mut uart: Uart<'static, esp_hal::Async>) {
 
                         // AUX7 (channel 11, index 10) 3-position strobe
                         // AUX8 (channel 12, index 11) spring switch override → full
-                        // Suppress strobe for first 10s after boot and when TX is not linked
+                        // Only active when armed, TX linked, and past boot guard
                         let uptime_ms = embassy_time::Instant::now().as_millis();
-                        if count >= 12 && uptime_ms > 10_000 && tx_linked {
+                        if count >= 12 && uptime_ms > 10_000 && tx_linked && strobe_allowed {
                             let aux7 = rc_channels[10];
                             let aux8 = rc_channels[11];
-                            let strobe_level: u8 = if aux8 > 1800 {
-                                255 // AUX8 spring switch → full blast
-                            } else if aux7 > 1650 {
-                                255 // AUX7 position 3 → full
+                            let strobe_level: u8 = if aux8 > 1800 || aux7 > 1650 {
+                                255 // AUX8 spring switch or AUX7 position 3 → full
                             } else if aux7 > 1250 {
                                 80  // AUX7 position 2 → low
                             } else {

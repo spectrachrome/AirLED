@@ -15,20 +15,23 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 - RX write callback processes the full BLE write as a complete command (no newline framing)
 - BLE TX buffer shrunk from 512 to 32 bytes; RX reassembly buffer removed entirely
 
+### Added
+
+- `TestPattern` command (`0xF0`): triggers a 5-second solid-color episode (red/green/blue/white) at full intensity, bypassing all post-processing
+- `GetVersion` command returning protocol version + firmware semver
+- TX link detection via RC stick channels (±10 deadband around 1500 µs center)
+- `tx_linked` field exposed in BLE state snapshot for app display
+
+### Fixed
+
+- Phantom strobe activation on bench: gate AUX strobe on armed/arming-allowed flight mode so default RC channel values (~1500) can't trigger it with no TX powered on
+- TX link detection: use ±10 deadband around 1500 instead of exact comparison to tolerate FC jitter
+- UART desync: drain stale RX bytes before each MSP_RC poll to prevent misreads after MSP_STATUS timeout
+
 ### Removed
 
 - JSON-over-NUS BLE protocol (`Command` enum, `StateResponse` struct, serde-based parsing/serialization)
 - `serde`, `serde_json_core`, and `heapless` dependencies
-
-### Added
-
-- TX link detection via RC stick channels — if all 4 sticks (AETR) read exactly 1500 µs, no TX is bound; strobe only activates when TX is linked
-- `tx_linked` field exposed in BLE state snapshot for app display
-- `GetVersion` command returning protocol version + firmware semver
-- `TestPattern` command (`0xF0`): triggers a 5-second solid-color episode (red/green/blue/white) at full intensity, bypassing all post-processing
-
-### Removed
-
 - Wi-Fi AP hotspot, HTTP web UI, and DHCP server (BLE is now the sole control interface)
 - `embassy-net`, `smoltcp`, `edge-dhcp`, and `embedded-io` dependencies
 - `wifi` and `coex` features from `esp-radio` (no longer needed without Wi-Fi)
