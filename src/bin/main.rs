@@ -31,11 +31,10 @@ use xiao_drone_led_controller::pattern::{
     Animation, ColorScheme, Pulse, RippleEffect, StaticAnim,
 };
 use xiao_drone_led_controller::postfx::{PostEffect, apply_pipeline};
-use xiao_drone_led_controller::ble::{
-    self as ble_proto, HandleResult,
-};
+use xiao_drone_led_controller::ble::{self as ble_proto, HandleResult};
 use xiao_drone_led_controller::state::{
     AnimMode, AnimModeParams, BLE_FLASH, ColorMode, FlightMode, STATE, STATE_CHANGED,
+    TEST_PATTERN,
 };
 use static_cell::StaticCell;
 
@@ -127,28 +126,16 @@ fn main() -> ! {
 const BLE_CHUNK_SIZE: usize = 20;
 
 
-/// Shared BLE RX reassembly buffer (written by write callback, read by notifier).
-struct BleRxBuf {
-    data: [u8; 256],
-    len: usize,
-}
-
 /// Shared BLE TX response buffer (written by write callback/notifier, sent by notifier).
 struct BleTxBuf {
-    data: [u8; 512],
+    data: [u8; 32],
     len: usize,
     offset: usize,
 }
 
-static BLE_RX: critical_section::Mutex<core::cell::RefCell<BleRxBuf>> =
-    critical_section::Mutex::new(core::cell::RefCell::new(BleRxBuf {
-        data: [0; 256],
-        len: 0,
-    }));
-
 static BLE_TX: critical_section::Mutex<core::cell::RefCell<BleTxBuf>> =
     critical_section::Mutex::new(core::cell::RefCell::new(BleTxBuf {
-        data: [0; 512],
+        data: [0; 32],
         len: 0,
         offset: 0,
     }));
@@ -159,46 +146,29 @@ static BLE_NOTIFY: embassy_sync::signal::Signal<
     (),
 > = embassy_sync::signal::Signal::new();
 
-/// Process a complete command message from the RX buffer.
+/// Process a binary command from the RX write callback.
 ///
 /// Called from the sync write callback. Writes the response into BLE_TX
 /// and signals the notifier.
-fn ble_handle_message(msg: &[u8]) {
-    let Some(cmd) = ble_proto::parse_command(msg) else {
-        // Write error response
-        critical_section::with(|cs| {
-            let mut tx = BLE_TX.borrow_ref_mut(cs);
-            let err = b"err:parse\n";
-            tx.data[..err.len()].copy_from_slice(err);
-            tx.len = err.len();
-            tx.offset = 0;
-        });
-        BLE_NOTIFY.signal(());
-        return;
-    };
-
-    defmt::info!("BLE cmd: {}", defmt::Debug2Format(&cmd));
+fn ble_handle_message(data: &[u8]) {
+    defmt::info!("BLE RX: {} bytes, cmd=0x{:02x}", data.len(), if data.is_empty() { 0 } else { data[0] });
 
     // Try to lock state synchronously (should almost always succeed)
     if let Ok(mut state) = STATE.try_lock() {
-        let result = ble_proto::handle_command(&cmd, &mut state);
+        let result = ble_proto::handle_binary_command(data, &mut state);
         critical_section::with(|cs| {
             let mut tx = BLE_TX.borrow_ref_mut(cs);
             tx.offset = 0;
             match result {
                 HandleResult::SendState => {
-                    let resp = ble_proto::build_state_response(&state);
-                    tx.len = ble_proto::serialize_state(&resp, &mut tx.data).unwrap_or(0);
+                    tx.len = ble_proto::encode_state(&state, &mut tx.data);
                 }
-                HandleResult::Ack => {
-                    tx.data[..3].copy_from_slice(b"ok\n");
-                    tx.len = 3;
+                HandleResult::SendVersion => {
+                    tx.len = ble_proto::encode_version(&mut tx.data);
                 }
-                HandleResult::Error(e) => {
-                    let eb = e.as_bytes();
-                    let len = eb.len().min(tx.data.len());
-                    tx.data[..len].copy_from_slice(&eb[..len]);
-                    tx.len = len;
+                HandleResult::Ack(code) => {
+                    tx.data[0] = code;
+                    tx.len = 1;
                 }
             }
         });
@@ -209,7 +179,7 @@ fn ble_handle_message(msg: &[u8]) {
 /// BLE Nordic UART Service task.
 ///
 /// Advertises as "AirLED", accepts connections, and serves the NUS GATT service.
-/// Commands arrive as JSON on RX; responses go out as notifications on TX.
+/// Commands arrive as binary on RX; responses go out as notifications on TX.
 #[embassy_executor::task]
 async fn ble_task(mut connector: BleConnector<'static>) {
     info!("BLE task started");
@@ -218,10 +188,8 @@ async fn ble_task(mut connector: BleConnector<'static>) {
     let mut ble = Ble::new(&mut connector, current_millis);
 
     loop {
-        // Reset buffers between connections
+        // Reset TX buffer between connections
         critical_section::with(|cs| {
-            let mut rx = BLE_RX.borrow_ref_mut(cs);
-            rx.len = 0;
             let mut tx = BLE_TX.borrow_ref_mut(cs);
             tx.len = 0;
             tx.offset = 0;
@@ -291,35 +259,8 @@ async fn ble_task(mut connector: BleConnector<'static>) {
                 }
             });
 
-            critical_section::with(|cs| {
-                let mut rx = BLE_RX.borrow_ref_mut(cs);
-                let space = rx.data.len() - rx.len;
-                let n = data.len().min(space);
-                let start = rx.len;
-                rx.data[start..start + n].copy_from_slice(&data[..n]);
-                rx.len = start + n;
-            });
-
-            // Check for complete message (newline-delimited)
-            let msg_result = critical_section::with(|cs| {
-                let rx = BLE_RX.borrow_ref(cs);
-                rx.data[..rx.len].iter().position(|&b| b == b'\n')
-            });
-
-            if let Some(nl_pos) = msg_result {
-                // Extract message and shift remainder
-                let mut msg = [0u8; 256];
-                let msg_len = critical_section::with(|cs| {
-                    let mut rx = BLE_RX.borrow_ref_mut(cs);
-                    msg[..nl_pos].copy_from_slice(&rx.data[..nl_pos]);
-                    let total = rx.len;
-                    let remaining = total - nl_pos - 1;
-                    rx.data.copy_within(nl_pos + 1..total, 0);
-                    rx.len = remaining;
-                    nl_pos
-                });
-                ble_handle_message(&msg[..msg_len]);
-            }
+            // Binary protocol: each BLE write is a complete command (no framing)
+            ble_handle_message(data);
         };
 
         // Read callback for NUS TX (unused — we use notifications)
@@ -389,16 +330,14 @@ async fn ble_task(mut connector: BleConnector<'static>) {
                         // Command response queued — loop back to send chunks
                     }
                     futures::future::Either::Right(_) => {
-                        // State changed — snapshot and queue
+                        // State changed — encode and queue binary snapshot
                         let state = STATE.lock().await;
-                        let resp = ble_proto::build_state_response(&state);
-                        drop(state);
                         critical_section::with(|cs| {
                             let mut tx = BLE_TX.borrow_ref_mut(cs);
-                            tx.len = ble_proto::serialize_state(&resp, &mut tx.data)
-                                .unwrap_or(0);
+                            tx.len = ble_proto::encode_state(&state, &mut tx.data);
                             tx.offset = 0;
                         });
+                        drop(state);
                         // Loop back to send chunks
                     }
                 }
@@ -681,10 +620,8 @@ async fn msp_task(mut uart: Uart<'static, esp_hal::Async>) {
                         if count >= 12 && uptime_ms > 10_000 && tx_linked && strobe_allowed {
                             let aux7 = rc_channels[10];
                             let aux8 = rc_channels[11];
-                            let strobe_level: u8 = if aux8 > 1800 {
-                                255 // AUX8 spring switch → full blast
-                            } else if aux7 > 1650 {
-                                255 // AUX7 position 3 → full
+                            let strobe_level: u8 = if aux8 > 1800 || aux7 > 1650 {
+                                255 // AUX8 spring switch or AUX7 position 3 → full
                             } else if aux7 > 1250 {
                                 80  // AUX7 position 2 → low
                             } else {
@@ -778,12 +715,27 @@ async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
     let mut flash_count: u8 = 0;
     let mut flash_total_frames: u32 = 0;
 
+    // Test pattern state: wall-clock deadline, solid color to display
+    let mut test_deadline: Option<embassy_time::Instant> = None;
+    let mut test_color = RGB8 { r: 0, g: 0, b: 0 };
+
     loop {
         // Check for new BLE flash request
         if let Some(count) = BLE_FLASH.try_take() {
             flash_count = count;
             // Will be computed after we know FPS below
             flash_remaining = u32::MAX; // sentinel — set properly after FPS read
+        }
+
+        // Check for new test pattern request
+        if let Some(color_code) = TEST_PATTERN.try_take() {
+            test_color = match color_code {
+                0 => RGB8 { r: 255, g: 0, b: 0 },
+                1 => RGB8 { r: 0, g: 255, b: 0 },
+                2 => RGB8 { r: 0, g: 0, b: 255 },
+                _ => RGB8 { r: 255, g: 255, b: 255 },
+            };
+            test_deadline = Some(embassy_time::Instant::now() + Duration::from_secs(5));
         }
 
         let state = STATE.lock().await;
@@ -878,6 +830,28 @@ async fn led_task(spi_bus: SpiDmaBus<'static, esp_hal::Blocking>) {
             flash_remaining -= 1;
 
             // Skip normal rendering and post-processing — write directly
+            match ws.write(buf.iter().copied()) {
+                Err(e) if !write_err_logged => {
+                    defmt::warn!("LED write error: {}", defmt::Debug2Format(&e));
+                    write_err_logged = true;
+                }
+                Ok(_) if write_err_logged => {
+                    info!("LED write recovered");
+                    write_err_logged = false;
+                }
+                _ => {}
+            }
+            frame_counter = frame_counter.wrapping_add(1);
+            Timer::after(Duration::from_millis(1000 / fps as u64)).await;
+            continue;
+        }
+
+        // Test pattern override: solid color for 5 seconds, no post-processing
+        if test_deadline.is_some_and(|d| embassy_time::Instant::now() < d) {
+            for led in active.iter_mut() {
+                *led = test_color;
+            }
+
             match ws.write(buf.iter().copied()) {
                 Err(e) if !write_err_logged => {
                     defmt::warn!("LED write error: {}", defmt::Debug2Format(&e));
