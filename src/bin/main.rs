@@ -177,6 +177,8 @@ fn ble_handle_message(msg: &[u8]) {
         return;
     };
 
+    defmt::info!("BLE cmd: {}", defmt::Debug2Format(&cmd));
+
     // Try to lock state synchronously (should almost always succeed)
     if let Ok(mut state) = STATE.try_lock() {
         let result = ble_proto::handle_command(&cmd, &mut state);
@@ -278,6 +280,8 @@ async fn ble_task(mut connector: BleConnector<'static>) {
 
         // Write callback for NUS RX characteristic (sync — runs inside do_work)
         let mut rx_wf = |_offset: usize, data: &[u8]| {
+            defmt::info!("BLE RX: {} bytes", data.len());
+
             // Flash blue on first write (= real client connection confirmed)
             critical_section::with(|cs| {
                 if !BLE_CONNECTED.borrow(cs).get() {

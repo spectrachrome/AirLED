@@ -20,7 +20,7 @@ const MAX_NUM_LEDS: u16 = 200;
 ///
 /// Uses serde's default externally-tagged representation:
 /// `{"GetState":null}` or `{"SetBrightness":{"value":128}}`.
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub enum Command {
     GetState,
     SetBrightness { value: u8 },
