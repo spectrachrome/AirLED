@@ -16,6 +16,9 @@ pub const MSP_BOXNAMES: u8 = 116;
 /// MSP command: RC channel values (16 × u16 LE, 1000–2000 µs).
 pub const MSP_RC: u8 = 105;
 
+/// MSP command: analog values (vbat, mAh drawn, RSSI, amps).
+pub const MSP_ANALOG: u8 = 110;
+
 /// MSP command: box IDs (permanent numeric IDs, one byte each).
 pub const MSP_BOXIDS: u8 = 119;
 
@@ -308,6 +311,22 @@ pub fn parse_rc_channels(payload: &[u8], size: u8, out: &mut [u16; MAX_RC_CHANNE
         out[i] = u16::from_le_bytes([payload[i * 2], payload[i * 2 + 1]]);
     }
     count
+}
+
+// ---------------------------------------------------------------------------
+// Analog / RSSI parser
+// ---------------------------------------------------------------------------
+
+/// Extract the RSSI value from an MSP_ANALOG response payload.
+///
+/// MSP_ANALOG payload: `[vbat: u8, mah_drawn: u16 LE, rssi: u16 LE, amps: i16 LE]`.
+/// RSSI is at bytes 3–4 as a u16 LE value (0–1023 in Betaflight).
+/// Returns `None` if the payload is too short.
+pub fn extract_rssi(payload: &[u8], size: u8) -> Option<u16> {
+    if size < 5 {
+        return None;
+    }
+    Some(u16::from_le_bytes([payload[3], payload[4]]))
 }
 
 // ---------------------------------------------------------------------------

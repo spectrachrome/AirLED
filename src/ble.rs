@@ -4,7 +4,8 @@
 //! Commands are received as compact binary frames on the RX characteristic,
 //! responses are sent as binary on the TX characteristic.
 
-use crate::state::{AnimMode, AnimModeParams, ColorMode, FlightMode, LedState, TEST_PATTERN};
+use crate::dither::DitherMode;
+use crate::state::{AnimMode, AnimModeParams, ColorMode, FlightMode, LedState};
 
 /// Maximum number of active LEDs (mirrors `MAX_LEDS` in main).
 const MAX_NUM_LEDS: u16 = 200;
@@ -37,7 +38,10 @@ const CMD_SET_PULSE_MIN_BRT: u8 = 0x1A;
 const CMD_SET_RIPPLE_SPEED: u8 = 0x1B;
 const CMD_SET_RIPPLE_WIDTH: u8 = 0x1C;
 const CMD_SET_RIPPLE_DECAY: u8 = 0x1D;
-const CMD_TEST_PATTERN: u8 = 0xF0;
+const CMD_SET_DITHER_MODE: u8 = 0x1E;
+const CMD_SET_DITHER_FPS: u8 = 0x1F;
+const CMD_DISPLAY_TEST_PATTERN: u8 = 0xF0;
+const CMD_CANCEL_TEST_PATTERN: u8 = 0xF1;
 
 // ---------------------------------------------------------------------------
 // Response codes (device → app)
@@ -60,7 +64,7 @@ pub const RSP_ERR_RANGE: u8 = 0xE1;
 
 /// Result of handling a binary command.
 pub enum HandleResult {
-    /// Send the full state snapshot (22 bytes).
+    /// Send the full state snapshot (25 bytes).
     SendState,
     /// Send the version response (5 bytes).
     SendVersion,
@@ -207,12 +211,50 @@ pub fn handle_binary_command(data: &[u8], state: &mut LedState) -> HandleResult 
             }
             HandleResult::Ack(RSP_OK)
         }
-
-        CMD_TEST_PATTERN if data.len() >= 2 => {
-            if data[1] > 3 {
+        CMD_SET_DITHER_MODE if data.len() >= 2 => {
+            let mode = match data[1] {
+                0 => DitherMode::Off,
+                1 => DitherMode::ErrorDiffusion,
+                2 => DitherMode::Ordered,
+                3 => DitherMode::Hybrid,
+                _ => return HandleResult::Ack(RSP_ERR_RANGE),
+            };
+            state.dither_mode = mode;
+            HandleResult::Ack(RSP_OK)
+        }
+        CMD_SET_DITHER_FPS if data.len() >= 3 => {
+            let val = u16::from_le_bytes([data[1], data[2]]);
+            if !(100..=960).contains(&val) {
                 return HandleResult::Ack(RSP_ERR_RANGE);
             }
-            TEST_PATTERN.signal(data[1]);
+            state.dither_fps = val;
+            HandleResult::Ack(RSP_OK)
+        }
+
+        // DisplayTestPattern: [color_mode, anim_mode, duration_ms(u16 LE)]
+        CMD_DISPLAY_TEST_PATTERN if data.len() >= 5 => {
+            let color = match data[1] {
+                0 => ColorMode::SolidGreen,
+                1 => ColorMode::SolidRed,
+                2 => ColorMode::Split,
+                3 => ColorMode::Rainbow,
+                _ => return HandleResult::Ack(RSP_ERR_RANGE),
+            };
+            let anim = match data[2] {
+                0 => AnimMode::Static,
+                1 => AnimMode::Pulse,
+                2 => AnimMode::Ripple,
+                _ => return HandleResult::Ack(RSP_ERR_RANGE),
+            };
+            let duration_ms = u16::from_le_bytes([data[3], data[4]]);
+            let frames = (state.fps as u32 * duration_ms as u32) / 1000;
+            state.test_color = color;
+            state.test_anim = anim;
+            state.test_pattern_frames = frames.max(1);
+            HandleResult::Ack(RSP_OK)
+        }
+        CMD_CANCEL_TEST_PATTERN => {
+            state.test_pattern_frames = 0;
             HandleResult::Ack(RSP_OK)
         }
 
@@ -220,11 +262,11 @@ pub fn handle_binary_command(data: &[u8], state: &mut LedState) -> HandleResult 
         CMD_SET_BRIGHTNESS | CMD_SET_FPS | CMD_SET_COLOR_MODE | CMD_SET_ANIM_MODE
         | CMD_SET_USE_HSI | CMD_SET_HUE_SPEED | CMD_SET_PULSE_MIN_BRT
         | CMD_SET_RIPPLE_SPEED | CMD_SET_RIPPLE_WIDTH | CMD_SET_RIPPLE_DECAY
-        | CMD_TEST_PATTERN => {
+        | CMD_SET_DITHER_MODE | CMD_DISPLAY_TEST_PATTERN => {
             HandleResult::Ack(RSP_ERR_PARSE)
         }
         CMD_SET_NUM_LEDS | CMD_SET_MAX_CURRENT | CMD_SET_PULSE_SPEED
-        | CMD_SET_COLOR_BALANCE => HandleResult::Ack(RSP_ERR_PARSE),
+        | CMD_SET_COLOR_BALANCE | CMD_SET_DITHER_FPS => HandleResult::Ack(RSP_ERR_PARSE),
 
         _ => HandleResult::Ack(RSP_ERR_PARSE),
     }
@@ -234,9 +276,9 @@ pub fn handle_binary_command(data: &[u8], state: &mut LedState) -> HandleResult 
 // State encoding
 // ---------------------------------------------------------------------------
 
-/// Encode the full state snapshot into `buf` (must be >= 22 bytes).
+/// Encode the full state snapshot into `buf` (must be >= 25 bytes).
 ///
-/// Returns the number of bytes written (always 22).
+/// Returns the number of bytes written (always 25).
 pub fn encode_state(state: &LedState, buf: &mut [u8]) -> usize {
     let (pulse_speed, pulse_min_brt) = match state.anim_params {
         AnimModeParams::Pulse {
@@ -265,16 +307,25 @@ pub fn encode_state(state: &LedState, buf: &mut [u8]) -> usize {
         AnimMode::Pulse => 1,
         AnimMode::Ripple => 2,
     };
+    let dither_mode: u8 = match state.dither_mode {
+        DitherMode::Off => 0,
+        DitherMode::ErrorDiffusion => 1,
+        DitherMode::Ordered => 2,
+        DitherMode::Hybrid => 3,
+    };
 
     let flags: u8 = (state.fc_connected as u8)
         | ((state.tx_linked as u8) << 1)
         | ((matches!(state.flight_mode, FlightMode::Armed) as u8) << 2)
         | ((matches!(state.flight_mode, FlightMode::Failsafe) as u8) << 3)
-        | ((matches!(state.flight_mode, FlightMode::ArmingAllowed) as u8) << 4);
+        | ((matches!(state.flight_mode, FlightMode::ArmingAllowed) as u8) << 4)
+        | (((state.test_pattern_frames > 0) as u8) << 5)
+        | ((state.strobe_split as u8) << 6);
 
     let num_leds = state.num_leds.to_le_bytes();
     let max_current = (state.max_current_ma as u16).to_le_bytes();
     let pulse_speed_le = pulse_speed.to_le_bytes();
+    let dither_fps_le = state.dither_fps.to_le_bytes();
 
     buf[0] = RSP_STATE;
     buf[1] = PROTOCOL_VERSION;
@@ -298,8 +349,11 @@ pub fn encode_state(state: &LedState, buf: &mut [u8]) -> usize {
     buf[19] = ripple_width;
     buf[20] = ripple_decay;
     buf[21] = flags;
+    buf[22] = dither_mode;
+    buf[23] = dither_fps_le[0];
+    buf[24] = dither_fps_le[1];
 
-    22
+    25
 }
 
 /// Encode the version response into `buf` (must be >= 5 bytes).
@@ -410,6 +464,50 @@ mod tests {
     }
 
     #[test]
+    fn set_dither_mode() {
+        let mut state = default_state();
+        let result = handle_binary_command(&[CMD_SET_DITHER_MODE, 3], &mut state);
+        assert!(matches!(result, HandleResult::Ack(RSP_OK)));
+        assert_eq!(state.dither_mode, DitherMode::Hybrid);
+    }
+
+    #[test]
+    fn set_dither_fps() {
+        let mut state = default_state();
+        let val: u16 = 480;
+        let bytes = val.to_le_bytes();
+        let result =
+            handle_binary_command(&[CMD_SET_DITHER_FPS, bytes[0], bytes[1]], &mut state);
+        assert!(matches!(result, HandleResult::Ack(RSP_OK)));
+        assert_eq!(state.dither_fps, 480);
+    }
+
+    #[test]
+    fn display_test_pattern() {
+        let mut state = default_state();
+        // color=rainbow(3), anim=pulse(1), duration=2000ms LE
+        let dur: u16 = 2000;
+        let dur_le = dur.to_le_bytes();
+        let result = handle_binary_command(
+            &[CMD_DISPLAY_TEST_PATTERN, 3, 1, dur_le[0], dur_le[1]],
+            &mut state,
+        );
+        assert!(matches!(result, HandleResult::Ack(RSP_OK)));
+        assert_eq!(state.test_color, ColorMode::Rainbow);
+        assert_eq!(state.test_anim, AnimMode::Pulse);
+        assert!(state.test_pattern_frames > 0);
+    }
+
+    #[test]
+    fn cancel_test_pattern() {
+        let mut state = default_state();
+        state.test_pattern_frames = 100;
+        let result = handle_binary_command(&[CMD_CANCEL_TEST_PATTERN], &mut state);
+        assert!(matches!(result, HandleResult::Ack(RSP_OK)));
+        assert_eq!(state.test_pattern_frames, 0);
+    }
+
+    #[test]
     fn empty_command_returns_parse_error() {
         let mut state = default_state();
         let result = handle_binary_command(&[], &mut state);
@@ -436,7 +534,7 @@ mod tests {
         let state = default_state();
         let mut buf = [0u8; 32];
         let n = encode_state(&state, &mut buf);
-        assert_eq!(n, 22);
+        assert_eq!(n, 25);
         assert_eq!(buf[0], RSP_STATE);
         assert_eq!(buf[1], PROTOCOL_VERSION);
         assert_eq!(buf[2], state.brightness);
@@ -446,6 +544,8 @@ mod tests {
         assert_eq!(buf[5], state.fps);
         // flags: fc_connected=false → 0x00
         assert_eq!(buf[21], 0x00);
+        // dither_mode = Off = 0
+        assert_eq!(buf[22], 0x00);
     }
 
     #[test]
@@ -466,9 +566,20 @@ mod tests {
         state.fc_connected = true;
         state.tx_linked = true;
         state.flight_mode = FlightMode::Armed;
-        let mut buf = [0u8; 22];
+        let mut buf = [0u8; 25];
         encode_state(&state, &mut buf);
         // flags: fc_connected=1, tx_linked=1<<1, armed=1<<2 = 0b00000111 = 0x07
         assert_eq!(buf[21], 0x07);
+    }
+
+    #[test]
+    fn encode_state_flags_test_active_and_strobe_split() {
+        let mut state = default_state();
+        state.test_pattern_frames = 50;
+        state.strobe_split = true;
+        let mut buf = [0u8; 25];
+        encode_state(&state, &mut buf);
+        // flags: test_active=1<<5, strobe_split=1<<6 = 0b01100000 = 0x60
+        assert_eq!(buf[21], 0x60);
     }
 }

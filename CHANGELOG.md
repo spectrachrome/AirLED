@@ -9,23 +9,33 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ### Changed
 
-- BLE protocol replaced with compact binary encoding (22-byte state snapshot, 1–4 byte commands) — see `docs/binary_protocol.md`
+- BLE protocol replaced with compact binary encoding (25-byte state snapshot, 1–5 byte commands) — see `docs/binary_protocol.md`
 - State snapshots now fit in 1–2 BLE packets (down from ~15 with JSON)
 - Setter acks reduced to a single byte (`0x00` OK / `0xE0` parse / `0xE1` range)
 - RX write callback processes the full BLE write as a complete command (no newline framing)
 - BLE TX buffer shrunk from 512 to 32 bytes; RX reassembly buffer removed entirely
+- Remap AUX strobe switches: AUX7 3-way off → red/green → white, AUX8 momentary → white strobe at 80
+- Add `strobe_split` field to `LedState` for position-light strobe mode
 
 ### Added
 
-- `TestPattern` command (`0xF0`): triggers a 5-second solid-color episode (red/green/blue/white) at full intensity, bypassing all post-processing
-- `GetVersion` command returning protocol version + firmware semver
-- TX link detection via RC stick channels (±10 deadband around 1500 µs center)
-- `tx_linked` field exposed in BLE state snapshot for app display
+- Temporal dithering module (`src/dither.rs`): adds extra perceived bit depth to WS2812B LEDs by varying quantized output frame-to-frame faster than flicker fusion
+- `DitherMode` enum with four modes: `Off`, `ErrorDiffusion` (smooth gradients), `Ordered` (Bayer 4x4, deterministic), `Hybrid` (error diffusion + correlated ordered for low brightness)
+- 8.8 fixed-point gamma LUTs (3 x 256 entries, 1536 bytes flash) computed at compile time for high-precision gamma correction in the dithered path
+- `SetDitherMode` (`0x1E`) and `SetDitherFps` (`0x1F`) binary commands for runtime control of dithering
+- `dither_mode` and `dither_fps` fields in binary state snapshot
+- Inner dither loop in LED task: animation renders at `fps` rate, strip refreshes at `dither_fps` rate (100–960 Hz) with different dither patterns between animation frames
+- Dither state auto-reset on mode change, strobe activation, and BLE flash sequences
+- Unit tests for dither algorithms (error diffusion convergence, ordered determinism, Fix16 gamma roundtrip)
+- `DisplayTestPattern` (`0xF0`) binary command: temporarily force a color + animation combo for a given duration, overriding FC flight mode patterns
+- `CancelTestPattern` (`0xF1`) binary command: stop a running test pattern immediately
+- `test_active` and `strobe_split` flags packed into binary state snapshot flags byte
+- `GetVersion` command (`0x02`) returning protocol version + firmware semver
+- TX link detection via flight mode (strobe only activates when FC reports ArmingAllowed or better)
+- `tx_linked` field exposed in binary state snapshot for app display
 
 ### Fixed
 
-- Phantom strobe activation on bench: gate AUX strobe on armed/arming-allowed flight mode so default RC channel values (~1500) can't trigger it with no TX powered on
-- TX link detection: use ±10 deadband around 1500 instead of exact comparison to tolerate FC jitter
 - UART desync: drain stale RX bytes before each MSP_RC poll to prevent misreads after MSP_STATUS timeout
 
 ### Removed

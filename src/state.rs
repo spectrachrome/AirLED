@@ -7,6 +7,8 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
 
+use crate::dither::DitherMode;
+
 /// Active color scheme.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, defmt::Format)]
 pub enum ColorMode {
@@ -135,10 +137,24 @@ pub struct LedState {
     pub debug_arm_box: u8,
     /// Index of the FAILSAFE box in the BOXNAMES map (255 = not found).
     pub debug_failsafe_box: u8,
-    /// AUX7 strobe intensity (0 = off, nonzero = peak brightness).
+    /// AUX strobe intensity (0 = off, nonzero = peak brightness).
     pub aux_strobe: u8,
+    /// When true, strobe uses position-light colours (red port / green starboard).
+    pub strobe_split: bool,
     /// Whether the RC transmitter has an active link (RSSI > 0).
     pub tx_linked: bool,
+    /// Temporal dithering method (Off, ErrorDiffusion, Ordered, Hybrid).
+    pub dither_mode: DitherMode,
+    /// Dither refresh rate in Hz (100–960). Only used when dither_mode != Off.
+    /// Animation updates still happen at `fps` rate; the strip is refreshed
+    /// at this rate with dithered sub-frames between animation updates.
+    pub dither_fps: u16,
+    /// Remaining frames for a BLE test pattern (0 = inactive).
+    pub test_pattern_frames: u32,
+    /// Color mode for the active test pattern.
+    pub test_color: ColorMode,
+    /// Animation mode for the active test pattern.
+    pub test_anim: AnimMode,
 }
 
 impl Default for LedState {
@@ -162,7 +178,13 @@ impl Default for LedState {
             debug_arm_box: 255,
             debug_failsafe_box: 255,
             aux_strobe: 0,
+            strobe_split: false,
             tx_linked: false,
+            dither_mode: DitherMode::Off,
+            dither_fps: 300,
+            test_pattern_frames: 0,
+            test_color: ColorMode::Split,
+            test_anim: AnimMode::Static,
         }
     }
 }
@@ -171,12 +193,6 @@ impl Default for LedState {
 ///
 /// The LED task picks this up and plays a blue flash sequence over 750 ms.
 pub static BLE_FLASH: Signal<CriticalSectionRawMutex, u8> = Signal::new();
-
-/// Test pattern request: color code (0=red, 1=green, 2=blue, 3=white).
-///
-/// The LED task picks this up and plays a 5-second solid color episode,
-/// bypassing all post-processing (gamma, balance, current limit).
-pub static TEST_PATTERN: Signal<CriticalSectionRawMutex, u8> = Signal::new();
 
 /// Signal to notify the BLE task that state has changed.
 ///
@@ -209,5 +225,11 @@ pub static STATE: Mutex<CriticalSectionRawMutex, LedState> = Mutex::new(LedState
     debug_arm_box: 255,
     debug_failsafe_box: 255,
     aux_strobe: 0,
+    strobe_split: false,
     tx_linked: false,
+    dither_mode: DitherMode::Off,
+    dither_fps: 300,
+    test_pattern_frames: 0,
+    test_color: ColorMode::Split,
+    test_anim: AnimMode::Static,
 });
